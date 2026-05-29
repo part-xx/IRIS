@@ -1,4 +1,5 @@
 \import Arith.Nat
+\import Arith.Int
 \import Data.Bool
 \import Data.List
 \import Data.Maybe
@@ -67,6 +68,7 @@
   | IsZero (e : Expr)
   | Pred (e : Expr)
   | Mul (e1 e2 : Expr)
+  | Add (e1 e2 : Expr)
   | Load (e : Expr)
   | Store (e1 e2 : Expr)
   | Alloc (e : Expr)
@@ -108,6 +110,7 @@
   | IsZero e => IsZero (subst x v e)
   | Pred e => Pred (subst x v e)
   | Mul e1 e2 => Mul (subst x v e1) (subst x v e2)
+  | Add e1 e2 => Add (subst x v e1) (subst x v e2)
   | Alloc e => Alloc (subst x v e)
   | Load e => Load (subst x v e)
   | Store e1 e2 => Store (subst x v e1) (subst x v e2)
@@ -212,6 +215,10 @@
          (p1 : e1 = Mul (Val (LitV (LitInt (pos a)))) (Val (LitV (LitInt (pos b)))))
          (p2 : e2 = Val (LitV (LitInt (pos (a Nat.* b)))))
          (p3 : s2 = s1)
+  | AddS (a b : Int)
+         (p1 : e1 = Add (Val (LitV (LitInt a))) (Val (LitV (LitInt b))))
+         (p2 : e2 = Val (LitV (LitInt (a IntRing.+ b))))
+         (p3 : s2 = s1)
 
 \func Reducible (e : Expr) (s : State) : \Prop =>
   TruncP (\Sigma (e' : Expr) (s' : State) (PrimStep e s e' s'))
@@ -232,6 +239,7 @@
   | InjL _ => \case p \with {}
   | InjR _ => \case p \with {}
   | Case _ _ _ => \case p \with {}
+  | Add _ _ => \case p \with {}
   | Alloc _ => \case p \with {}
   | Load _ => \case p \with {}
   | Store _ _ => \case p \with {}
@@ -257,6 +265,7 @@
   | IsZeroPosS n p1 p2 p3 => rewrite p1 idp
   | PredS n p1 p2 p3 => rewrite p1 idp
   | MulS a b p1 p2 p3 => rewrite p1 idp
+  | AddS a b p1 p2 p3 => rewrite p1 idp
 
 -- =================================================================================
 -- Mathematical factorial on Nat

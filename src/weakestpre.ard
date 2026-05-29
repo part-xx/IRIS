@@ -1,5 +1,6 @@
 \import Logic
 \import Arith.Nat
+\import Arith.Int
 \import Data.List
 \import Order.PartialOrder
 \import Data.Bool
@@ -480,6 +481,133 @@
   : properUPred_ent
     (wp e (\lam v => wp (If (Val v) t f) Phi))
     (wp (If e t f) Phi)
+  => {?}
+
+-- =================================================================================
+-- Sum types: injections and case
+-- =================================================================================
+--
+-- These follow the HeapLang pattern: InjL/InjR take a pure head step into the
+-- corresponding value, and Case applies the selected branch to the injected
+-- value.  Each rule is `wp_value_intro` composed with `wp_pure_step` over the
+-- relevant PrimStep constructor.
+
+\lemma wp_inj_l
+  {cnt : Countable Loc}
+  (v   : Value)
+  (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent (Phi (InjLV v)) (wp (InjL (Val v)) Phi)
+  => properUPred_ent_trans
+      (Phi (InjLV v))
+      (wp (Val (InjLV v)) Phi)
+      (wp (InjL (Val v)) Phi)
+      (wp_value_intro (InjLV v) Phi)
+      (wp_pure_step (InjL (Val v)) (Val (InjLV v))
+          (\lam sigma => InjLS v idp idp idp) idp Phi)
+
+\lemma wp_inj_r
+  {cnt : Countable Loc}
+  (v   : Value)
+  (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent (Phi (InjRV v)) (wp (InjR (Val v)) Phi)
+  => properUPred_ent_trans
+      (Phi (InjRV v))
+      (wp (Val (InjRV v)) Phi)
+      (wp (InjR (Val v)) Phi)
+      (wp_value_intro (InjRV v) Phi)
+      (wp_pure_step (InjR (Val v)) (Val (InjRV v))
+          (\lam sigma => InjRS v idp idp idp) idp Phi)
+
+\lemma wp_case_l
+  {cnt : Countable Loc}
+  (v     : Value)
+  (e1 e2 : Expr)
+  (Phi   : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent
+    (wp (App e1 (Val v)) Phi)
+    (wp (Case (Val (InjLV v)) e1 e2) Phi)
+  => wp_pure_step (Case (Val (InjLV v)) e1 e2) (App e1 (Val v))
+      (\lam sigma => CaseLS v e1 e2 idp idp idp) idp Phi
+
+\lemma wp_case_r
+  {cnt : Countable Loc}
+  (v     : Value)
+  (e1 e2 : Expr)
+  (Phi   : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent
+    (wp (App e2 (Val v)) Phi)
+    (wp (Case (Val (InjRV v)) e1 e2) Phi)
+  => wp_pure_step (Case (Val (InjRV v)) e1 e2) (App e2 (Val v))
+      (\lam sigma => CaseRS v e1 e2 idp idp idp) idp Phi
+
+-- wp_bind rules for the new evaluation contexts (InjL □, InjR □, Case □ e1 e2).
+-- Like every other wp_bind_* in this file they await the generic bind proof.
+
+\lemma wp_bind_injl
+  {cnt : Countable Loc}
+  (e   : Expr)
+  (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent
+    (wp e (\lam v => wp (InjL (Val v)) Phi))
+    (wp (InjL e) Phi)
+  => {?}
+
+\lemma wp_bind_injr
+  {cnt : Countable Loc}
+  (e   : Expr)
+  (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent
+    (wp e (\lam v => wp (InjR (Val v)) Phi))
+    (wp (InjR e) Phi)
+  => {?}
+
+\lemma wp_bind_case
+  {cnt : Countable Loc}
+  (e e1 e2 : Expr)
+  (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent
+    (wp e (\lam v => wp (Case (Val v) e1 e2) Phi))
+    (wp (Case e e1 e2) Phi)
+  => {?}
+
+-- =================================================================================
+-- Integer addition
+-- =================================================================================
+
+\lemma wp_add
+  {cnt : Countable Loc}
+  (a b : Int)
+  (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent
+    (Phi (LitV (LitInt (a IntRing.+ b))))
+    (wp (Add (Val (LitV (LitInt a))) (Val (LitV (LitInt b)))) Phi)
+  => properUPred_ent_trans
+      (Phi (LitV (LitInt (a IntRing.+ b))))
+      (wp (Val (LitV (LitInt (a IntRing.+ b)))) Phi)
+      (wp (Add (Val (LitV (LitInt a))) (Val (LitV (LitInt b)))) Phi)
+      (wp_value_intro (LitV (LitInt (a IntRing.+ b))) Phi)
+      (wp_pure_step
+          (Add (Val (LitV (LitInt a))) (Val (LitV (LitInt b))))
+          (Val (LitV (LitInt (a IntRing.+ b))))
+          (\lam sigma => AddS a b idp idp idp) idp Phi)
+
+\lemma wp_bind_add_l
+  {cnt : Countable Loc}
+  (e1 e2 : Expr)
+  (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent
+    (wp e1 (\lam v => wp (Add (Val v) e2) Phi))
+    (wp (Add e1 e2) Phi)
+  => {?}
+
+\lemma wp_bind_add_r
+  {cnt : Countable Loc}
+  (v1 : Value)
+  (e2 : Expr)
+  (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent
+    (wp e2 (\lam v => wp (Add (Val v1) (Val v)) Phi))
+    (wp (Add (Val v1) e2) Phi)
   => {?}
 
 -- (S5) Heap operations
