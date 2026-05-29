@@ -1,3 +1,4 @@
+\import Paths
 \import interface
 \import lang
 \import uPred

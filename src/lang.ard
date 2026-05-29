@@ -48,6 +48,8 @@
   | LamV (x : String) (body : Expr)
   | RecV (f x : String) (body : Expr)
   | PairV (v1 v2 : Value)
+  | InjLV (v : Value)
+  | InjRV (v : Value)
 
 \data Expr : \Set
   | Val (v : Value)
@@ -59,6 +61,9 @@
   | Pair (e1 e2 : Expr)
   | Fst (e : Expr)
   | Snd (e : Expr)
+  | InjL (e : Expr)
+  | InjR (e : Expr)
+  | Case (e0 e1 e2 : Expr)
   | IsZero (e : Expr)
   | Pred (e : Expr)
   | Mul (e1 e2 : Expr)
@@ -97,6 +102,9 @@
   | Pair e1 e2 => Pair (subst x v e1) (subst x v e2)
   | Fst e => Fst (subst x v e)
   | Snd e => Snd (subst x v e)
+  | InjL e => InjL (subst x v e)
+  | InjR e => InjR (subst x v e)
+  | Case e0 e1 e2 => Case (subst x v e0) (subst x v e1) (subst x v e2)
   | IsZero e => IsZero (subst x v e)
   | Pred e => Pred (subst x v e)
   | Mul e1 e2 => Mul (subst x v e1) (subst x v e2)
@@ -157,6 +165,22 @@
           (p1 : e1 = Pair (Val v1) (Val v2))
           (p2 : e2 = Val (PairV v1 v2))
           (p3 : s2 = s1)
+  | InjLS (v : Value)
+          (p1 : e1 = InjL (Val v))
+          (p2 : e2 = Val (InjLV v))
+          (p3 : s2 = s1)
+  | InjRS (v : Value)
+          (p1 : e1 = InjR (Val v))
+          (p2 : e2 = Val (InjRV v))
+          (p3 : s2 = s1)
+  | CaseLS (v : Value) (br1 br2 : Expr)
+           (p1 : e1 = Case (Val (InjLV v)) br1 br2)
+           (p2 : e2 = App br1 (Val v))
+           (p3 : s2 = s1)
+  | CaseRS (v : Value) (br1 br2 : Expr)
+           (p1 : e1 = Case (Val (InjRV v)) br1 br2)
+           (p2 : e2 = App br2 (Val v))
+           (p3 : s2 = s1)
   | AllocS (v : Value) (l : Loc)
            (fresh : glookup s1.heap l = nothing)
            (p1 : e1 = Alloc (Val v))
@@ -205,6 +229,9 @@
   | Pair _ _ => \case p \with {}
   | Fst _ => \case p \with {}
   | Snd _ => \case p \with {}
+  | InjL _ => \case p \with {}
+  | InjR _ => \case p \with {}
+  | Case _ _ _ => \case p \with {}
   | Alloc _ => \case p \with {}
   | Load _ => \case p \with {}
   | Store _ _ => \case p \with {}
@@ -212,14 +239,24 @@
 \func val_stuck (e : Expr) (s : State) (e' : Expr) (s' : State)
                 (step : PrimStep e s e' s') : to_val e = nothing \elim step
   | BetaS x body v p1 p2 p3 => rewrite p1 idp
+  | RecBetaS f x body v p1 p2 p3 => rewrite p1 idp
+  | RecS f x body p1 p2 p3 => rewrite p1 idp
   | IfTrueS t f p1 p2 p3 => rewrite p1 idp
   | IfFalseS t f p1 p2 p3 => rewrite p1 idp
   | FstS v1 v2 p1 p2 p3 => rewrite p1 idp
   | SndS v1 v2 p1 p2 p3 => rewrite p1 idp
   | PairS v1 v2 p1 p2 p3 => rewrite p1 idp
+  | InjLS v p1 p2 p3 => rewrite p1 idp
+  | InjRS v p1 p2 p3 => rewrite p1 idp
+  | CaseLS v br1 br2 p1 p2 p3 => rewrite p1 idp
+  | CaseRS v br1 br2 p1 p2 p3 => rewrite p1 idp
   | AllocS v l fresh p1 p2 p3 => rewrite p1 idp
   | LoadS l v lookup p1 p2 p3 => rewrite p1 idp
   | StoreS l v v' allocated p1 p2 p3 => rewrite p1 idp
+  | IsZeroZeroS p1 p2 p3 => rewrite p1 idp
+  | IsZeroPosS n p1 p2 p3 => rewrite p1 idp
+  | PredS n p1 p2 p3 => rewrite p1 idp
+  | MulS a b p1 p2 p3 => rewrite p1 idp
 
 -- =================================================================================
 -- Mathematical factorial on Nat
