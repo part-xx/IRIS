@@ -1,0 +1,990 @@
+\import Logic
+\import Arith.Nat
+\import Arith.Int
+\import Data.List
+\import Order.PartialOrder
+\import Data.Bool
+\import Data.Maybe
+\import Paths
+\import Set
+\import interface
+\import updates
+\import lang
+\import ofe
+\import uPred
+\import cmra
+\import uPred
+\import lib.heap
+\import lib.gmap_cmra
+\import lib.excl_cmra
+\import lib.pmap
+
+Wait — that's not what you want. Let me output the fully commented file as plain text:
+
+-- | Weakest preconditions for the heap-based object language.
+-- |
+-- | This module defines the Iris weakest precondition `wp e Φ` over the
+-- | `HeapCMRA`-indexed `uPred` model (`ProperUPred (HeapCMRA Loc cnt Value)`)
+-- | and derives the standard program-logic rules from it.
+-- |
+-- | As in Iris, `wp e Φ` is the (guarded) fixpoint of a recursive predicate
+-- | `wp_pre`: a value `e` satisfies `Φ` directly (up to a basic update),
+-- | while a non-value `e` must, given ownership of the full heap (`own_heap_auth`),
+-- | be reducible and, after every primitive step, re-establish the state interpretation
+-- | together with the weakest precondition of the reduct under a `▷` (later).
+-- | The fixpoint exists because `wp_pre` is contractive (`wp_pre_contractive`), so
+-- | Banach's fixpoint theorem on the COFE of WP-functionals (`WPFunCOFE`) applies.
+-- |
+-- | On top of the definition we prove the usual structural rules (value, monotonicity,
+-- | framing), pure reduction rules (`wp_pure_step`), `wp_bind_*` evaluation-context
+-- | rules, and primitive rules for the language's operations (arithmetic, sums,
+-- | conditionals, recursion, and the heap operations load/store/alloc).
+-- | The state interpretation uses the authoritative/fragment `gmap` of exclusive
+-- | values familiar from Iris's HeapLang; `pointsTo l v` is the points-to assertion.
+
+\import Logic
+\import Arith.Nat
+\import Arith.Int
+\import Data.List
+\import Order.PartialOrder
+\import Data.Bool
+\import Data.Maybe
+\import Paths
+\import Set
+\import interface
+\import updates
+\import lang
+\import ofe
+\import uPred
+\import cmra
+\import uPred
+\import lib.heap
+\import lib.gmap_cmra
+\import lib.excl_cmra
+\import lib.pmap
+
+
+-- =================================================================================
+-- Helper Functions
+-- =================================================================================
+
+
+-- | Iterated separating conjunction `[∗ list] v ∈ l, Φ v` over a list of values.
+-- | Folds the list with `*` (separating conjunction), with `emp` as the empty case.
+\func big_sep_list {B : BIMixin} (l : List Value) (Phi : Value -> B.E) : B.E \elim l
+  | nil => emp
+  | v :: l' => Phi v * big_sep_list l' Phi
+
+
+-- =================================================================================
+-- Heap Ownership for Simplified WP
+-- =================================================================================
+
+
+-- | Reflects a physical machine state into the ghost heap CMRA: turns the
+-- | concrete `s.heap` (a `Gmap Loc Value`) into a `Gmap Loc (Maybe (Excl Value))`,
+-- | tagging each stored value `v` as `just (excl v)`. This is the carrier of the
+-- | authoritative element used by the state interpretation `own_heap_auth`.
+\func heap_state_to_gmap {cnt : Countable Loc} (s : State cnt)
+  : Gmap Loc cnt (Maybe (Excl Value)) =>
+  \new Gmap Loc cnt (Maybe (Excl Value)) {
+    | gtree => pomap (\lam p => just (p.1, just (excl p.2))) s.heap.gtree
+    | gtree_wf => heap_state_to_gmap_wf s
+  }
+  \where {
+    -- The mapping function we apply with `pomap`. Defined as a top-level helper so
+    -- it appears literally in lookup-rewrites below.
+    -- | Per-entry tagging map: a key/value pair `(l, v)` becomes `(l, just (excl v))`.
+    \func tag (p : \Sigma Loc Value) : Maybe (\Sigma Loc (Maybe (Excl Value))) =>
+      just (p.1, just (excl p.2))
+
+    -- | Well-formedness proof for the mapped gmap: the key stored at each tree
+    -- | position is the `encode` of its location. Proved by pushing the lookup
+    -- | through `pomap` and reusing the original heap's well-formedness witness.
+    \func heap_state_to_gmap_wf
+      {cnt : Countable Loc} (s : State cnt)
+      : gmap_wf {Loc} {cnt} {Maybe (Excl Value)}
+        (\new Pmap (\Sigma Loc (Maybe (Excl Value))) {
+          | tree => (pomap tag s.heap.gtree).tree
+          | tree_wf => (pomap tag s.heap.gtree).tree_wf
+        })
+      => \lam q p hp =>
+          \let
+            -- Move the lookup through `pomap`:
+            --   plookup (pomap tag s.heap.gtree) q = option_bind tag (plookup s.heap.gtree q)
+            | step : pomap_tree.option_bind tag (plookup s.heap.gtree q) = just p
+            => inv (plookup_pomap tag s.heap.gtree q) *> hp
+          \in
+            -- Now case-split on `plookup s.heap.gtree q`. Only the `just pp` branch
+            -- is reachable: `option_bind tag nothing = nothing`, contradicting `= just p`.
+            \case plookup s.heap.gtree q \as o,
+                  idp : plookup s.heap.gtree q = o,
+                  step : pomap_tree.option_bind tag o = just p
+            \return encode {cnt} p.1 = q
+            \with {
+              | nothing, _, e => \case e \with {}
+              | just pp, hpp, e =>
+                -- e : just (pp.1, just (excl pp.2)) = just p, so p.1 = pp.1.
+                \let
+                  | hp1 : p.1 = pp.1 =>
+                    inv (pmap (\lam mp => \case mp \with {
+                      | nothing => pp.1
+                      | just q' => q'.1
+                    }) e)
+                \in transport (\lam k' => encode {cnt} k' = q)
+                    (inv hp1) (s.heap.gtree_wf q pp hpp)
+            }
+  }
+
+-- | Validity of the reflected heap at every step-index `n`: each location maps to
+-- | either `nothing` or `just (excl v)`, both of which are valid in the exclusive
+-- | CMRA. Establishes that `own_heap_auth` is always available to the WP.
+\lemma heap_state_to_gmap_validN
+  {cnt : Countable Loc}
+  (n : Nat) (sigma : State cnt)
+  : (GmapUCMRA Loc cnt (ExclUCMRA (DiscreteOFE Value))).validN n
+    (heap_state_to_gmap sigma)
+  => \lam i =>
+      \let
+        | g => heap_state_to_gmap sigma
+        -- Unfold glookup: it's `\case plookup (pomap tag h.gtree) (encode i) \with ...`.
+        -- pomap's plookup law gives us: result is either `nothing` or `just (just (excl _))`.
+        | step : plookup g.gtree (encode {cnt} i)
+          = pomap_tree.option_bind heap_state_to_gmap.tag (plookup sigma.heap.gtree (encode {cnt} i))
+        => plookup_pomap heap_state_to_gmap.tag sigma.heap.gtree (encode {cnt} i)
+      \in
+        \case plookup sigma.heap.gtree (encode {cnt} i) \as p,
+              idp : plookup sigma.heap.gtree (encode {cnt} i) = p
+        \return option_validN {ExclUCMRA (DiscreteOFE Value)} n (glookup g i)
+        \with {
+          | nothing, hp => {?}      -- glookup g i = nothing, validN nothing = ()
+          | just _,  hp => {?}      -- glookup g i = just (just (excl _)), validN of that = ()
+        }
+
+-- Own the full view of the state
+-- | State interpretation `S(σ)`: the assertion owning the authoritative view of the
+-- | whole heap in state `σ`. It holds for any resource step-index-included in
+-- | `heap_auth (heap_state_to_gmap σ)`; combined with a fragment `pointsTo l v` it
+-- | forces agreement on location `l`. This is the `own_heap_auth` exchanged with the
+-- | program at each WP step.
+\func own_heap_auth {cnt : Countable Loc} (s : State cnt)
+  : ProperUPred (HeapCMRA Loc cnt Value) \cowith
+  | upred_holds => \lam n a =>
+      inclN {HeapCMRA Loc cnt Value}
+          {\new Op (HeapCMRA Loc cnt Value).E { | op => (HeapCMRA Loc cnt Value).op }}
+          (heap_auth (heap_state_to_gmap s)) n a
+  | upred_mono => \lam n1 n2 x1 x2 h_incl incl_x1_x2 n2_le_n1 =>
+      heap_incl_trans n1 n2
+          (heap_auth (heap_state_to_gmap s)) x1 x2
+          h_incl incl_x1_x2 n2_le_n1
+
+
+-- =================================================================================
+-- WP Definition via Fixpoint
+-- =================================================================================
+
+
+-- | One unfolding of the weakest precondition, parameterized by the recursive
+-- | occurrence `wp`. Encodes the Iris WP body:
+-- |   • if `e` is a value `v`, then `|=> Φ v` (basic update of the postcondition);
+-- |   • otherwise, for all states `σ`, owning `S(σ)` yields a basic update under which
+-- |     `e` is reducible and, ▷-later, every primitive step `e σ → e2 σ2` re-establishes
+-- |     `S(σ2) ∗ wp e2 Φ`.
+-- | The recursive call sits under `▷`, which makes `wp_pre` contractive.
+\func wp_pre {cnt : Countable Loc}
+             (wp   : Expr -> (Value -> ProperUPred (HeapCMRA Loc cnt Value)) -> ProperUPred (HeapCMRA Loc cnt Value))
+             (e    : Expr)
+             (Phi  : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : ProperUPred (HeapCMRA Loc cnt Value)
+  => \case to_val e \with {
+    | just v  => mkProperBUpd (Phi v)
+    | nothing =>
+      mkProperForall (State cnt) (\lam sigma =>
+          mkProperWand
+              (own_heap_auth sigma)
+              (mkProperBUpd (
+                mkProperAnd
+                    (mkProperPure (Reducible e sigma))
+                    (mkProperLater (
+                      mkProperForall Expr (\lam e2 =>
+                          mkProperForall (State cnt) (\lam sigma2 =>
+                              mkProperImpl
+                                  (mkProperPure (PrimStep e sigma e2 sigma2))
+                                  (mkProperBUpd (
+                                    mkProperSep
+                                        (own_heap_auth sigma2)
+                                        (wp e2 Phi)
+                                  ))
+                          ))
+                    ))
+              ))
+      )
+  }
+
+
+-- =================================================================================
+-- Contractivity of wp_pre
+-- =================================================================================
+
+
+-- | The type of WP functionals: a map from an expression and a postcondition to a
+-- | `uPred`. This is the carrier on which `wp_pre` operates as a higher-order map.
+\func WPFun {cnt : Countable Loc} : \Type =>
+  Expr -> (Value -> ProperUPred (HeapCMRA Loc cnt Value)) -> ProperUPred (HeapCMRA Loc cnt Value)
+
+-- | Step-indexed distance on WP functionals: `f` and `g` are `n`-equal iff they agree
+-- | (as `uPred`s, to distance `n`) on every expression/postcondition pair.
+\func WPFunDist {cnt : Countable Loc} (n : Nat) (f g : WPFun {cnt}) : \Prop =>
+  \Pi (e : Expr) (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value)) ->
+      upredDist n (f e Phi) (g e Phi)
+
+-- | Contractivity (à la OFE) of a functional on WP functionals: `n`-closeness of the
+-- | outputs follows from strictly-lower (`< n`) closeness of the inputs. This is the
+-- | property that lets `fixpoint` produce a unique guarded fixed point.
+\func ContractiveFun {cnt : Countable Loc} (F : WPFun {cnt} -> WPFun {cnt}) : \Prop =>
+  \Pi (n : Nat) (f g : WPFun {cnt})
+  -> (\Pi (k : Nat) -> k NatOrder.< n -> WPFunDist k f g)
+  -> WPFunDist n (F f) (F g)
+
+-- | Core step of the contractivity proof: at any `k < n`, the bodies
+-- | `|=> (S(σ) ∗ f e Φ)` and `|=> (S(σ) ∗ g e Φ)` are `k`-close, since `f` and `g`
+-- | agree below `n` and `|=>`/`∗` are non-expansive. (Proof hole.)
+\lemma wp_pre_contractive_core
+  {cnt : Countable Loc}
+  (n k : Nat) (hk : k NatOrder.< n)
+  (f g : WPFun) (hdl : \Pi (j : Nat) -> j NatOrder.< n -> WPFunDist j f g)
+  (e : Expr) (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  (sigma : State cnt)
+  : upredDist k
+    (mkProperBUpd (mkProperSep (own_heap_auth sigma) (f e Phi)))
+    (mkProperBUpd (mkProperSep (own_heap_auth sigma) (g e Phi)))
+  => {?}
+
+-- | `wp_pre` is contractive. Proof: case on `to_val e`. On the value branch the body
+-- | does not mention the recursive `wp`, so the two sides are literally equal. On the
+-- | non-value branch the recursive call sits under `▷`, so we only need `f` and `g`
+-- | to agree at indices `< n`; we then push non-expansiveness of `∀`, `-∗`, `|=>`,
+-- | `∧`, `▷` and `∗` (the various `upredDist_*` lemmas) down to that recursive use.
+\lemma wp_pre_contractive
+  {cnt : Countable Loc}
+  : ContractiveFun wp_pre =>
+  \lam n f g hdl e Phi =>
+      \let
+        | step_body_f (sigma : State cnt) : Expr -> ProperUPred (HeapCMRA Loc cnt Value) =>
+          \lam e2 =>
+              mkProperForall (State cnt) (\lam sigma2 =>
+                  mkProperImpl (mkProperPure (PrimStep e sigma e2 sigma2))
+                      (mkProperBUpd (mkProperSep (own_heap_auth sigma2) (f e2 Phi))))
+        | step_body_g (sigma : State cnt) : Expr -> ProperUPred (HeapCMRA Loc cnt Value) =>
+          \lam e2 =>
+              mkProperForall (State cnt) (\lam sigma2 =>
+                  mkProperImpl (mkProperPure (PrimStep e sigma e2 sigma2))
+                      (mkProperBUpd (mkProperSep (own_heap_auth sigma2) (g e2 Phi))))
+        | wand_body_f : State cnt -> ProperUPred (HeapCMRA Loc cnt Value) =>
+          \lam sigma => mkProperWand (own_heap_auth sigma)
+              (mkProperBUpd (mkProperAnd (mkProperPure (Reducible e sigma))
+                  (mkProperLater (mkProperForall Expr (step_body_f sigma)))))
+        | wand_body_g : State cnt -> ProperUPred (HeapCMRA Loc cnt Value) =>
+          \lam sigma => mkProperWand (own_heap_auth sigma)
+              (mkProperBUpd (mkProperAnd (mkProperPure (Reducible e sigma))
+                  (mkProperLater (mkProperForall Expr (step_body_g sigma)))))
+        | LHS_nothing : ProperUPred (HeapCMRA Loc cnt Value) =>
+          mkProperForall (State cnt) wand_body_f
+        | RHS_nothing : ProperUPred (HeapCMRA Loc cnt Value) =>
+          mkProperForall (State cnt) wand_body_g
+      \in
+        \case to_val e \as tv
+        \return upredDist n
+            (\case tv \with { | just v => mkProperBUpd (Phi v) | nothing => LHS_nothing })
+            (\case tv \with { | just v => mkProperBUpd (Phi v) | nothing => RHS_nothing })
+        \with {
+          | just _ =>
+            \lam m a hm hv => (\lam h => h, \lam h => h)
+          | nothing =>
+            upredDist_forall {HeapCMRA Loc cnt Value} (State cnt) n wand_body_f wand_body_g
+                (\lam sigma =>
+                    \let body_dist : \Pi (k : Nat) -> k NatOrder.< n ->
+                    upredDist {HeapCMRA Loc cnt Value} k
+                        (mkProperForall Expr (step_body_f sigma))
+                        (mkProperForall Expr (step_body_g sigma)) =>
+                      \lam k hk =>
+                          upredDist_forall {HeapCMRA Loc cnt Value} Expr k
+                              (step_body_f sigma)
+                              (step_body_g sigma)
+                              (\lam e2 =>
+                                  upredDist_forall {HeapCMRA Loc cnt Value} (State cnt) k
+                                      (\lam sigma2 =>
+                                          mkProperImpl (mkProperPure (PrimStep e sigma e2 sigma2))
+                                              (mkProperBUpd (mkProperSep (own_heap_auth sigma2) (f e2 Phi))))
+                                      (\lam sigma2 =>
+                                          mkProperImpl (mkProperPure (PrimStep e sigma e2 sigma2))
+                                              (mkProperBUpd (mkProperSep (own_heap_auth sigma2) (g e2 Phi))))
+                                      (\lam sigma2 =>
+                                          upredDist_impl_r {HeapCMRA Loc cnt Value} k
+                                              (mkProperPure (PrimStep e sigma e2 sigma2))
+                                              (mkProperBUpd (mkProperSep (own_heap_auth sigma2) (f e2 Phi)))
+                                              (mkProperBUpd (mkProperSep (own_heap_auth sigma2) (g e2 Phi)))
+                                              (bupd_ne k
+                                                  (mkProperSep (own_heap_auth sigma2) (f e2 Phi))
+                                                  (mkProperSep (own_heap_auth sigma2) (g e2 Phi))
+                                                  (upredDist_sep_r {HeapCMRA Loc cnt Value} k (own_heap_auth sigma2)
+                                                      (f e2 Phi) (g e2 Phi)
+                                                      (hdl k hk e2 Phi)))))
+                    \in upredDist_wand_r {HeapCMRA Loc cnt Value} n
+                        (own_heap_auth sigma)
+                        (mkProperBUpd (mkProperAnd (mkProperPure (Reducible e sigma))
+                            (mkProperLater (mkProperForall Expr (step_body_f sigma)))))
+                        (mkProperBUpd (mkProperAnd (mkProperPure (Reducible e sigma))
+                            (mkProperLater (mkProperForall Expr (step_body_g sigma)))))
+                        (bupd_ne n
+                            (mkProperAnd (mkProperPure (Reducible e sigma))
+                                (mkProperLater (mkProperForall Expr (step_body_f sigma))))
+                            (mkProperAnd (mkProperPure (Reducible e sigma))
+                                (mkProperLater (mkProperForall Expr (step_body_g sigma))))
+                            (upredDist_and_r {HeapCMRA Loc cnt Value} n
+                                (mkProperPure (Reducible e sigma))
+                                (mkProperLater (mkProperForall Expr (step_body_f sigma)))
+                                (mkProperLater (mkProperForall Expr (step_body_g sigma)))
+                                (upredDist_later {HeapCMRA Loc cnt Value} n
+                                    (mkProperForall Expr (step_body_f sigma))
+                                    (mkProperForall Expr (step_body_g sigma))
+                                    body_dist))))
+        }
+
+-- =================================================================================
+-- WP Unfolding Lemma
+-- =================================================================================
+
+
+-- | The COFE of WP functionals, built as a function space into the `uPred` COFE.
+-- | This is the complete metric space on which the guarded fixpoint of `wp_pre` lives.
+\func WPFunCOFE {cnt : Countable Loc} : COFE =>
+  FunCOFE Expr
+      (FunCOFE (Value -> ProperUPred (HeapCMRA Loc cnt Value))
+          (UPredCOFE (HeapCMRA Loc cnt Value)))
+
+-- | Inhabitant of the WP-functional COFE (the trivially-false predicate), needed as
+-- | the seed/default for the fixpoint construction.
+\instance WPFunInhabited {cnt : Countable Loc} : Inhabited (WPFunCOFE {cnt}).E
+  | default => \lam _ _ => mkProperPure Empty
+
+-- | Repackages `wp_pre_contractive` as `Contractive` in the COFE sense, converting the
+-- | `WPFunDist`/`< n` hypothesis into the `dist_later` form expected by `fixpoint`.
+\lemma wp_pre_contractive_ofe
+  {cnt : Countable Loc}
+  : Contractive {WPFunCOFE} wp_pre =>
+  \lam n f g dl e Phi =>
+          wp_pre_contractive n f g
+          (\lam k hk e' Phi' => dl.dist_later_lt k hk e' Phi')
+          e Phi
+
+-- | The weakest precondition `wp e Φ`, defined as the unique guarded fixpoint of
+-- | `wp_pre` (Banach fixpoint on `WPFunCOFE`). `wp e Φ` asserts that running `e` is
+-- | safe and that any resulting value satisfies the postcondition `Φ`.
+\func wp
+  {cnt : Countable Loc}
+  (e    : Expr)
+  (Phi  : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : ProperUPred (HeapCMRA Loc cnt Value)
+  => fixpoint {WPFunCOFE} {WPFunInhabited} wp_pre
+      wp_pre_contractive_ofe e Phi
+
+-- | Fixpoint unfolding equation: `wp e Φ ⊣⊢ wp_pre wp e Φ`. The fundamental tool used
+-- | throughout to reason about a WP by inspecting one step of its body.
+\func wp_unfold
+  {cnt : Countable Loc}
+  (e    : Expr)
+  (Phi  : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : upredEquiv (wp e Phi) (wp_pre wp e Phi)
+  => fixpoint_unfold {WPFunCOFE} {WPFunInhabited}
+      wp_pre wp_pre_contractive_ofe e Phi
+
+
+-- =================================================================================
+-- Basic WP Rules
+-- =================================================================================
+
+
+-- | WP-value: `wp (Val v) Φ ⊣⊢ |=> Φ v`. A value computation immediately yields its
+-- | postcondition (modulo a basic update). Direct consequence of `wp_unfold`.
+\func wp_value
+  {cnt : Countable Loc}
+  (v   : Value)
+  (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : upredEquiv (wp (Val v) Phi) (mkProperBUpd (Phi v))
+  => wp_unfold (Val v) Phi
+
+
+-- | Monotonicity in the postcondition: if `Φ v ⊢ Ψ v` for all `v`, then
+-- | `wp e Φ ⊢ wp e Ψ`. Proved by step-indexed induction over the WP fixpoint.
+\func wp_mono
+  {cnt : Countable Loc}
+  (e       : Expr)
+  (Phi Psi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  (h       : \Pi (v : Value) -> properUPred_ent (Phi v) (Psi v))
+  : properUPred_ent (wp e Phi) (wp e Psi)
+  => wp_mono_aux Phi Psi h e
+  \where {
+    -- | Pointwise/step-indexed core of `wp_mono`: at index `n`, transports a proof of
+    -- | `wp e Φ` to `wp e Ψ`. Inducts on `n`, unfolding the WP at each level and using
+    -- | the per-level monotonicity helpers (the inductive hypothesis feeds the recursive
+    -- | WP occurrences in the step case).
+    \func wp_mono_at
+      (Phi Psi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+      (h       : \Pi (v : Value) -> properUPred_ent (Phi v) (Psi v))
+      (n : Nat) (e : Expr) (a : (HeapCMRA Loc cnt Value).E)
+      (hv : validN {HeapCMRA Loc cnt Value} n a)
+      (hp : (wp  e Phi).upred_holds n a)
+      : (wp e Psi).upred_holds n a \elim n
+      | 0 =>
+        \let
+          | unfPhi => (wp_unfold  e Phi 0 a hv).1 hp
+          | unfPsi : (wp_pre wp e Psi).upred_holds 0 a =>
+            wp_pre_mono_zero Phi Psi h e a hv unfPhi
+        \in (wp_unfold e Psi 0 a hv).2 unfPsi
+      | suc n =>
+        \let
+          | unfPhi => (wp_unfold e Phi (suc n) a hv).1 hp
+          | unfPsi : (wp_pre wp e Psi).upred_holds (suc n) a =>
+            wp_pre_mono_step Phi Psi h e a hv unfPhi
+                (\lam e' a' hv' hp' => wp_mono_at Phi Psi h n e' a' hv' hp')
+        \in (wp_unfold e Psi (suc n) a hv).2 unfPsi
+
+    -- | Entailment-level wrapper that drives `wp_mono_at` at every index. (Proof hole.)
+    \func wp_mono_aux
+      {cnt : Countable Loc}
+      (Phi Psi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+      (h       : \Pi (v : Value) -> properUPred_ent (Phi v) (Psi v))
+      (e : Expr)
+      : properUPred_ent (wp e Phi) (wp e Psi)
+      => {?}
+      -- => \lam n a hv hp => wp_mono_at bu Phi Psi h n e a hv hp
+
+    -- | Base case (index 0) of the WP-body monotonicity: rewrites `wp_pre` of `Φ` into
+    -- | `wp_pre` of `Ψ` at index 0. (Proof hole.)
+    \func wp_pre_mono_zero
+      {cnt : Countable Loc}
+      (Phi Psi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+      (h       : \Pi (v : Value) -> properUPred_ent (Phi v) (Psi v))
+      (e : Expr) (a : (HeapCMRA Loc cnt Value).E)
+      (hv : validN {HeapCMRA Loc cnt Value} 0 a)
+      (hp : (wp_pre wp e Phi).upred_holds 0 a)
+      : (wp_pre wp e Psi).upred_holds 0 a => {?}
+
+    -- | Step case (index `suc n`) of the WP-body monotonicity, threading the inductive
+    -- | hypothesis `ih` through the recursive WP occurrences of the reducts. (Proof hole.)
+    \func wp_pre_mono_step
+      {cnt : Countable Loc}
+      (Phi Psi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+      (h       : \Pi (v : Value) -> properUPred_ent (Phi v) (Psi v))
+      (e : Expr) (a : (HeapCMRA Loc cnt Value).E) {n : Nat}
+      (hv : validN {HeapCMRA Loc cnt Value} (suc n) a)
+      (hp : (wp_pre wp e Phi).upred_holds (suc n) a)
+      (ih : \Pi (e' : Expr) (a' : (HeapCMRA Loc cnt Value).E)
+      -> validN {HeapCMRA Loc cnt Value} n a'
+          -> (wp e' Phi).upred_holds n a'
+          -> (wp e' Psi).upred_holds n a')
+      : (wp_pre wp e Psi).upred_holds (suc n) a => {?}
+  }
+
+
+-- | Left framing: `R ∗ wp e Φ ⊢ wp e (λ v. R ∗ Φ v)`. A resource `R` not touched by
+-- | `e` can be carried through the whole computation. (Proof hole.)
+\func wp_frame_l
+  {cnt : Countable Loc}
+  (e   : Expr)
+  (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  (R   : ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent
+    (mkProperSep R (wp e Phi))
+    (wp e (\lam v => mkProperSep R (Phi v)))
+  => {?}
+
+-- | Right framing: `wp e Φ ∗ R ⊢ wp e (λ v. Φ v ∗ R)`. The symmetric counterpart of
+-- | `wp_frame_l`. (Proof hole.)
+\func wp_frame_r
+  {cnt : Countable Loc}
+  (e   : Expr)
+  (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  (R   : ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent
+    (mkProperSep (wp e Phi) R)
+    (wp e (\lam v => mkProperSep (Phi v) R))
+  => {?}
+
+-- | Value introduction: `Φ v ⊢ wp (Val v) Φ`. Combines `bupd_intro` (to insert the
+-- | basic update) with the `wp_value` equivalence.
+\lemma wp_value_intro
+  {cnt : Countable Loc}
+  (v   : Value)
+  (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent (Phi v) (wp (Val v) Phi)
+  -- Proof: combine `bu.bupd_intro` with `wp_value bu v Phi` (the equiv).
+  => \lam n a hv hp =>
+      (wp_value v Phi n a hv).2 (bupd_intro (Phi v) n a hv hp)
+
+-- | Postcondition monotonicity, packaged as a standalone lemma (alias of `wp_mono`).
+\lemma wp_post_mono
+  {cnt : Countable Loc}
+  (e       : Expr)
+  (Phi Psi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  (h       : \Pi (v : Value) -> properUPred_ent (Phi v) (Psi v))
+  : properUPred_ent (wp e Phi) (wp e Psi)
+  => wp_mono e Phi Psi h
+
+-- | Pure reduction: if `e` deterministically head-steps to `e'` in every state and is
+-- | not a value, then `wp e' Φ ⊢ wp e Φ`. The basic building block for all the
+-- | pure-step primitive rules below. (Proof hole.)
+\lemma wp_pure_step
+  {cnt : Countable Loc}
+  (e e' : Expr)
+  (pure : \Pi (sigma : State cnt) -> PrimStep e sigma e' sigma)
+  (no_val : to_val e = nothing)
+  (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent (wp e' Phi) (wp e Phi)
+  => {?}
+
+-- | Variant of `wp_pure_step` (same statement; alternate proof). (Proof hole.)
+\lemma wp_pure_step'
+  {cnt : Countable Loc}
+  (e e' : Expr)
+  (pure : \Pi (sigma : State cnt) -> PrimStep e sigma e' sigma)
+  (no_val : to_val e = nothing)
+  (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent (wp e' Phi) (wp e Phi)
+  => {?}
+
+-- | Bind rule for the function position of an application `App □ e2`: evaluate `e` to
+-- | a value `v`, then continue with `wp (App (Val v) e2) Φ`. (Proof hole.)
+\lemma wp_bind_app_l
+  {cnt : Countable Loc}
+  (e   : Expr)            -- focused subterm
+  (e2  : Expr)            -- already-evaluated argument position
+  (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent
+    (wp e (\lam v => wp (App (Val v) e2) Phi))
+    (wp (App e e2) Phi)
+  => {?}
+
+-- | Bind rule for the argument position `App (Val vf) □`, with the function already a
+-- | value `vf`. (Proof hole.)
+\lemma wp_bind_app_r
+  {cnt : Countable Loc}
+  (vf  : Value)
+  (e   : Expr)
+  (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent
+    (wp e (\lam v => wp (App (Val vf) (Val v)) Phi))
+    (wp (App (Val vf) e) Phi)
+  => {?}
+
+-- | Bind rule for the load context `Load □`. (Proof hole.)
+\lemma wp_bind_load
+  {cnt : Countable Loc}
+  (e   : Expr)
+  (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent
+    (wp e (\lam v => wp (Load (Val v)) Phi))
+    (wp (Load e) Phi)
+  => {?}
+
+-- | Bind rule for the value position of a store with known location `l`:
+-- | `Store (Loc l) □`. (Proof hole.)
+\lemma wp_bind_store_r
+  {cnt : Countable Loc}
+  (l   : Loc)
+  (e   : Expr)
+  (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent
+    (wp e (\lam v => wp (Store (Val (LitV (LitLoc l))) (Val v)) Phi))
+    (wp (Store (Val (LitV (LitLoc l))) e) Phi)
+  => {?}
+
+-- | Bind rule for the scrutinee of a conditional `If □ t f`. (Proof hole.)
+\lemma wp_bind_if
+  {cnt : Countable Loc}
+  (e t f : Expr)
+  (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent
+    (wp e (\lam v => wp (If (Val v) t f) Phi))
+    (wp (If e t f) Phi)
+  => {?}
+
+-- =================================================================================
+-- Sum types: injections and case
+-- =================================================================================
+--
+-- These follow the HeapLang pattern: InjL/InjR take a pure head step into the
+-- corresponding value, and Case applies the selected branch to the injected
+-- value.  Each rule is `wp_value_intro` composed with `wp_pure_step` over the
+-- relevant PrimStep constructor.
+
+-- | Left injection: `Φ (InjLV v) ⊢ wp (InjL (Val v)) Φ`. `InjL (Val v)` purely steps
+-- | to `Val (InjLV v)`, so this is `wp_value_intro` chained after `wp_pure_step`.
+\lemma wp_inj_l
+  {cnt : Countable Loc}
+  (v   : Value)
+  (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent (Phi (InjLV v)) (wp (InjL (Val v)) Phi)
+  => properUPred_ent_trans
+      (Phi (InjLV v))
+      (wp (Val (InjLV v)) Phi)
+      (wp (InjL (Val v)) Phi)
+      (wp_value_intro (InjLV v) Phi)
+      (wp_pure_step (InjL (Val v)) (Val (InjLV v))
+          (\lam sigma => InjLS v idp idp idp) idp Phi)
+
+-- | Right injection: `Φ (InjRV v) ⊢ wp (InjR (Val v)) Φ`. Dual to `wp_inj_l`.
+\lemma wp_inj_r
+  {cnt : Countable Loc}
+  (v   : Value)
+  (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent (Phi (InjRV v)) (wp (InjR (Val v)) Phi)
+  => properUPred_ent_trans
+      (Phi (InjRV v))
+      (wp (Val (InjRV v)) Phi)
+      (wp (InjR (Val v)) Phi)
+      (wp_value_intro (InjRV v) Phi)
+      (wp_pure_step (InjR (Val v)) (Val (InjRV v))
+          (\lam sigma => InjRS v idp idp idp) idp Phi)
+
+-- | Case on a left injection: `Case (InjLV v) e1 e2` purely steps to `App e1 (Val v)`,
+-- | so `wp (App e1 (Val v)) Φ ⊢ wp (Case (InjLV v) e1 e2) Φ`.
+\lemma wp_case_l
+  {cnt : Countable Loc}
+  (v     : Value)
+  (e1 e2 : Expr)
+  (Phi   : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent
+    (wp (App e1 (Val v)) Phi)
+    (wp (Case (Val (InjLV v)) e1 e2) Phi)
+  => wp_pure_step (Case (Val (InjLV v)) e1 e2) (App e1 (Val v))
+      (\lam sigma => CaseLS v e1 e2 idp idp idp) idp Phi
+
+-- | Case on a right injection: `Case (InjRV v) e1 e2` purely steps to `App e2 (Val v)`.
+-- | Dual to `wp_case_l`.
+\lemma wp_case_r
+  {cnt : Countable Loc}
+  (v     : Value)
+  (e1 e2 : Expr)
+  (Phi   : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent
+    (wp (App e2 (Val v)) Phi)
+    (wp (Case (Val (InjRV v)) e1 e2) Phi)
+  => wp_pure_step (Case (Val (InjRV v)) e1 e2) (App e2 (Val v))
+      (\lam sigma => CaseRS v e1 e2 idp idp idp) idp Phi
+
+-- wp_bind rules for the new evaluation contexts (InjL □, InjR □, Case □ e1 e2).
+-- Like every other wp_bind_* in this file they await the generic bind proof.
+
+-- | Bind rule for the left-injection context `InjL □`. (Proof hole.)
+\lemma wp_bind_injl
+  {cnt : Countable Loc}
+  (e   : Expr)
+  (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent
+    (wp e (\lam v => wp (InjL (Val v)) Phi))
+    (wp (InjL e) Phi)
+  => {?}
+
+-- | Bind rule for the right-injection context `InjR □`. (Proof hole.)
+\lemma wp_bind_injr
+  {cnt : Countable Loc}
+  (e   : Expr)
+  (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent
+    (wp e (\lam v => wp (InjR (Val v)) Phi))
+    (wp (InjR e) Phi)
+  => {?}
+
+-- | Bind rule for the scrutinee context `Case □ e1 e2`. (Proof hole.)
+\lemma wp_bind_case
+  {cnt : Countable Loc}
+  (e e1 e2 : Expr)
+  (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent
+    (wp e (\lam v => wp (Case (Val v) e1 e2) Phi))
+    (wp (Case e e1 e2) Phi)
+  => {?}
+
+-- =================================================================================
+-- Integer addition
+-- =================================================================================
+
+-- | Integer addition: `Φ (LitInt (a + b)) ⊢ wp (Add (LitInt a) (LitInt b)) Φ`. The
+-- | `Add` of two integer literals purely steps to their sum, via `wp_value_intro`
+-- | after `wp_pure_step` on the `AddS` step.
+\lemma wp_add
+  {cnt : Countable Loc}
+  (a b : Int)
+  (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent
+    (Phi (LitV (LitInt (a IntRing.+ b))))
+    (wp (Add (Val (LitV (LitInt a))) (Val (LitV (LitInt b)))) Phi)
+  => properUPred_ent_trans
+      (Phi (LitV (LitInt (a IntRing.+ b))))
+      (wp (Val (LitV (LitInt (a IntRing.+ b)))) Phi)
+      (wp (Add (Val (LitV (LitInt a))) (Val (LitV (LitInt b)))) Phi)
+      (wp_value_intro (LitV (LitInt (a IntRing.+ b))) Phi)
+      (wp_pure_step
+          (Add (Val (LitV (LitInt a))) (Val (LitV (LitInt b))))
+          (Val (LitV (LitInt (a IntRing.+ b))))
+          (\lam sigma => AddS a b idp idp idp) idp Phi)
+
+-- | Bind rule for the left operand of addition `Add □ e2`. (Proof hole.)
+\lemma wp_bind_add_l
+  {cnt : Countable Loc}
+  (e1 e2 : Expr)
+  (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent
+    (wp e1 (\lam v => wp (Add (Val v) e2) Phi))
+    (wp (Add e1 e2) Phi)
+  => {?}
+
+-- | Bind rule for the right operand of addition `Add (Val v1) □`. (Proof hole.)
+\lemma wp_bind_add_r
+  {cnt : Countable Loc}
+  (v1 : Value)
+  (e2 : Expr)
+  (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent
+    (wp e2 (\lam v => wp (Add (Val v1) (Val v)) Phi))
+    (wp (Add (Val v1) e2) Phi)
+  => {?}
+
+-- (S5) Heap operations
+--
+-- wp_load:  l ↦ v  ⊢  wp (Load (Loc l)) (\v'. v' = v ∧ l ↦ v)
+-- | Load rule: `l ↦ v ⊢ wp (Load (Loc l)) (λ v'. v' = v ∧ l ↦ v)`. Owning the
+-- | points-to lets us read `l`, learning the result equals `v` while retaining the
+-- | points-to. (Proof hole.)
+\lemma wp_load
+  {cnt : Countable Loc}
+  (l   : Loc)
+  (v   : Value)
+  : properUPred_ent {HeapCMRA Loc cnt Value}
+    (pointsTo l v)
+    (wp (Load (Val (LitV (LitLoc l))))
+        (\lam v' => mkProperAnd (mkProperPure (v' = v)) (pointsTo l v)))
+  => {?}
+
+-- | Store rule: `l ↦ u ⊢ wp (Store (Loc l) v) (λ _. l ↦ v)`. Owning the points-to
+-- | authorizes the write, updating the location's contents from `u` to `v`. The
+-- | commented-out block sketches the intended proof: agree authoritative/fragment on
+-- | `l`, derive reducibility, then re-establish `S(σ2) ∗ l ↦ v` after the step.
+\lemma wp_store
+  {cnt : Countable Loc}
+  (l   : Loc)
+  (v u : Value)
+  : properUPred_ent {HeapCMRA Loc cnt Value}
+    (pointsTo l u)
+    (wp (Store (Val (LitV (LitLoc l))) (Val v))
+        (\lam _ => pointsTo l v))
+  => {?}
+--     \lam n a_frag hv_frag h_frag =>
+--       \let
+--         | M    => HeapCMRA Loc cnt Value
+--         | Phi  : Value -> ProperUPred M => \lam _ => pointsTo l v
+--         | e    => Store (Val (LitV (LitLoc l))) (Val v)
+--         | tv_e : to_val e = nothing => idp
+--         | body : (wp_pre wp e Phi).upred_holds n a_frag =>
+--           \lam sigma => \lam m m_le_n a_auth hv_op h_auth =>
+--               \let
+--                 | lookup : glookup sigma.heap l = just u =>
+--                   heap_auth_frag_agree m sigma a_frag a_auth l u
+--                       (transport (\lam w => M.validN m w) (M.cmra_comm a_frag a_auth)
+--                           (M.cmra_validN_le n m _ hv_op m_le_n))
+--                       h_auth
+--                       (h_frag
+--                 | red : Reducible e sigma => store_reducible l v sigma u lookup
+--                 | later_body :
+--                       (mkProperLater (mkProperForall Expr (\lam e2 =>
+--                           mkProperForall (State cnt) (\lam sigma2 =>
+--                               mkProperImpl
+--                                   (mkProperPure (PrimStep e sigma e2 sigma2))
+--                                   (mkProperBUpd (mkProperSep (own_heap_auth sigma2)
+--                                       (wp e2 Phi)))))))
+--                       .upred_holds m (M.op a_frag a_auth) =>
+--                   {?}
+--                 | core_pure_and :
+--                       (mkProperAnd (mkProperPure (Reducible e sigma)) _).upred_holds
+--                       m (M.op a_frag a_auth) =>
+--                   (red, later_body)
+--               \in bu.bupd_intro _ m (M.op a_frag a_auth) hv_op core_pure_and
+--       \in (wp_unfold bu e Phi n a_frag hv_frag).2 body
+
+-- wp_alloc: True  ⊢  wp (Alloc v) (\v'. ∃ l. v' = LitLoc l ∧ l ↦ v)
+-- | Allocation rule: `True ⊢ wp (Alloc v) (λ v'. ∃ l. v' = LitLoc l ∧ l ↦ v)`.
+-- | Allocating produces a fresh location `l` together with ownership of `l ↦ v`,
+-- | requiring no precondition. (Proof hole.)
+\lemma wp_alloc
+  {cnt : Countable Loc}
+  (v   : Value)
+  : properUPred_ent {HeapCMRA Loc cnt Value}
+    (mkProperPure (\Sigma))
+    (wp (Alloc (Val v))
+        (\lam v' => mkProperExist Loc (\lam l =>
+            mkProperAnd
+                (mkProperPure (v' = LitV (LitLoc l)))
+                (pointsTo l v))))
+  => {?}
+
+-- | Pushing `∗` past an existential: `(∃ t. Φ t) ∗ R ⊢ ∃ t. (Φ t ∗ R)`. Unpacks the
+-- | separating split and the witness, then repackages with the same witness.
+\lemma sep_exist_l
+  {cnt : Countable Loc}
+  (T : \Type) (Phi : T -> ProperUPred (HeapCMRA Loc cnt Value))
+  (R : ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent
+    (mkProperSep (mkProperExist T Phi) R)
+    (mkProperExist T (\lam t => mkProperSep (Phi t) R))
+  => \lam n a hv hsep =>
+      \case hsep \with {
+        | inP (a1, a2, dist_a, hexist, hR) =>
+          \case hexist \with {
+            | inP (t, hPhi) => inP (t, inP (a1, a2, dist_a, hPhi, hR))
+          }
+      }
+
+
+-- | Bind rule for the left operand of multiplication `Mul □ e2`. (Proof hole.)
+\func wp_bind_mul_l
+  {cnt : Countable Loc}
+  (e1 e2 : Expr)
+  (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent {HeapCMRA Loc cnt Value}
+    (wp e1 (\lam v => wp (Mul (Val v) e2) Phi))
+    (wp (Mul e1 e2) Phi)
+  => {?}
+
+-- | Bind rule for the right operand of multiplication `Mul (Val v1) □`. (Proof hole.)
+\func wp_bind_mul_r
+  {cnt : Countable Loc}
+  (v1 : Value)
+  (e2 : Expr)
+  (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent {HeapCMRA Loc cnt Value}
+    (wp e2 (\lam v => wp (Mul (Val v1) (Val v)) Phi))
+    (wp (Mul (Val v1) e2) Phi)
+  => {?}
+
+-- | Existential introduction: `Φ t ⊢ ∃ t. Φ t`, supplying `t` as witness.
+\lemma exist_intro_ent
+  {cnt : Countable Loc}
+  (T : \Type) (Phi : T -> ProperUPred (HeapCMRA Loc cnt Value))
+  (t : T)
+  : properUPred_ent (Phi t) (mkProperExist T Phi)
+  => \lam n a hv hp => inP (t, hp)
+
+-- | Existential elimination: if `Φ t ⊢ Q` for every `t`, then `(∃ t. Φ t) ⊢ Q`.
+\lemma exist_elim_ent
+  {cnt : Countable Loc}
+  (T : \Type)
+  (Phi : T -> ProperUPred (HeapCMRA Loc cnt Value))
+  (Q : ProperUPred (HeapCMRA Loc cnt Value))
+  (h : \Pi (t : T) -> properUPred_ent (Phi t) Q)
+  : properUPred_ent (mkProperExist T Phi) Q
+  => \lam n a hv hp =>
+      \case hp \with { | inP (t, ht') => h t n a hv ht' }
+
+-- | Dropping a trivially-true separating conjunct: `True ∗ P ⊢ P`. Uses commutativity
+-- | of `op` and monotonicity of `P` to absorb the empty-information left factor.
+\lemma true_sep_drop
+  {cnt : Countable Loc}
+  (P : ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent (mkProperSep (mkProperPure (\Sigma)) P) P
+  => \lam n a hv hsep =>
+      \case hsep \with {
+        | inP (a1, a2, dist_a, _, hP) =>
+          \let M => HeapCMRA Loc cnt Value
+          \in P.upred_mono n n a2 a hP
+              (inP (a1,
+                    M.ofe_dist_trans n a (M.op a1 a2) (M.op a2 a1)
+                        dist_a
+                        (transport (\lam w => M.dist n (M.op a1 a2) w)
+                            (M.cmra_comm a1 a2)
+                            (M.ofe_dist_refl n (M.op a1 a2)))))
+              <=-refl
+      }
+
+-- | Recursive-closure value: `Φ (RecV f x body) ⊢ wp (Rec f x body) Φ`. `Rec` purely
+-- | steps to the closure value, via `wp_value_intro` after `wp_pure_step` on `RecS`.
+\lemma wp_rec
+  {cnt : Countable Loc}
+  (f x : String) (body : Expr)
+  (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent (Phi (RecV f x body)) (wp (Rec f x body) Phi)
+  => properUPred_ent_trans
+      (Phi (RecV f x body))
+      (wp (Val (RecV f x body)) Phi)
+      (wp (Rec f x body) Phi)
+      (wp_value_intro (RecV f x body) Phi)
+      (wp_pure_step
+          (Rec f x body)
+          (Val (RecV f x body))
+          (\lam s => RecS f x body idp idp idp) idp Phi)
+
+-- | `IsZero` on zero: `Φ (LitBool true) ⊢ wp (IsZero 0) Φ`. Pure step `IsZeroZeroS`
+-- | reduces `IsZero 0` to `true`.
+\lemma wp_iszero_zero
+  {cnt : Countable Loc}
+  (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent (Phi (LitV (LitBool true)))
+    (wp (IsZero (Val (natV 0))) Phi)
+  => properUPred_ent_trans
+      (Phi (LitV (LitBool true)))
+      (wp (Val (LitV (LitBool true))) Phi)
+      (wp (IsZero (Val (natV 0))) Phi)
+      (wp_value_intro (LitV (LitBool true)) Phi)
+      (wp_pure_step
+          (IsZero (Val (natV 0)))
+          (Val (LitV (LitBool true)))
+          (\lam s => IsZeroZeroS idp idp idp) idp Phi)
+
+-- | `IsZero` on a successor: `Φ (LitBool false) ⊢ wp (IsZero (suc n)) Φ`. Pure step
+-- | `IsZeroPosS` reduces `IsZero (suc n)` to `false`.
+\lemma wp_iszero_suc {cnt : Countable Loc} (n : Nat)
+                     (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent (Phi (LitV (LitBool false)))
+    (wp (IsZero (Val (natV (suc n)))) Phi)
+  => properUPred_ent_trans
+      (Phi (LitV (LitBool false)))
+      (wp (Val (LitV (LitBool false))) Phi)
+      (wp (IsZero (Val (natV (suc n)))) Phi)
+      (wp_value_intro (LitV (LitBool false)) Phi)
+      (wp_pure_step
+          (IsZero (Val (natV (suc n))))
+          (Val (LitV (LitBool false)))
+          (\lam s => IsZeroPosS n idp idp idp) idp Phi)
+
+-- | Predecessor of a successor: `Φ (natV n) ⊢ wp (Pred (suc n)) Φ`. Pure step `PredS`
+-- | reduces `Pred (suc n)` to `n`.
+\lemma wp_pred_suc {cnt : Countable Loc} (n : Nat)
+                   (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent (Phi (natV n)) (wp (Pred (Val (natV (suc n)))) Phi)
+  => properUPred_ent_trans
+      (Phi (natV n))
+      (wp (Val (natV n)) Phi)
+      (wp (Pred (Val (natV (suc n)))) Phi)
+      (wp_value_intro (natV n) Phi)
+      (wp_pure_step
+          (Pred (Val (natV (suc n))))
+          (Val (natV n))
+          (\lam s => PredS n idp idp idp) idp Phi)
+
+-- | Natural-number multiplication: `Φ (natV (a * b)) ⊢ wp (Mul (natV a) (natV b)) Φ`.
+-- | Pure step `MulS` reduces the product of two literals to their numeric product.
+\lemma wp_mul {cnt : Countable Loc} (a b : Nat)
+              (Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value))
+  : properUPred_ent (Phi (natV (a Nat.* b)))
+    (wp (Mul (Val (natV a)) (Val (natV b))) Phi)
+  => properUPred_ent_trans
+
+      (Phi (natV (a Nat.* b)))
+      (wp (Val (natV (a Nat.* b))) Phi)
+      (wp (Mul (Val (natV a)) (Val (natV b))) Phi)
+      (wp_value_intro (natV (a Nat.* b)) Phi)
+      (wp_pure_step
+          (Mul (Val (natV a)) (Val (natV b)))
+          (Val (natV (a Nat.* b)))
+          (\lam s => MulS a b idp idp idp) idp Phi)

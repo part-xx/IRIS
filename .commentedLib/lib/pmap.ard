@@ -1,0 +1,944 @@
+-- | Finite maps keyed by positive binary numbers, implemented as a canonical
+-- | radix (PATRICIA-style) tree. This is the Arend counterpart of stdpp's
+-- | `Pmap`/`gmap` construction, which underlies the heap and ghost-state maps
+-- | used to build Iris CMRAs (e.g. the `gmap K (option (agree …))` and
+-- | authoritative-heap resources).
+-- |
+-- | The central design idea is *canonicity*: the raw tree type `Pmap'` admits
+-- | several representations of the same map, but a well-formedness invariant
+-- | (`Pmap_wf`) rules out redundant empty nodes. On well-formed trees,
+-- | pointwise-equal lookup implies propositional equality (`pmap'_eq`), so the
+-- | wrapped type `Pmap` is *extensional*: a map is determined by its lookup
+-- | function. This is exactly the property Iris needs to treat maps as elements
+-- | of a discrete OFE/CMRA where equality is decided pointwise.
+-- |
+-- | Contents: the key type `Pos`; the raw tree `Pmap'` with lookup, the smart
+-- | constructor `PNode'`, and the operations `partial_alter'`/`merge'`/fmap/omap
+-- | together with their lookup and well-formedness laws; the wrapped canonical
+-- | `Pmap` with `pempty`, `pinsert`, `pdelete`, `psingleton`, `pmerge`, `pfmap`,
+-- | `pomap`; extensionality (`pmap_eq`); enumeration (`pmap_to_list`, `pdom`);
+-- | and the `pmap_ind` induction principle mirroring stdpp's `map_ind`.
+
+\import Logic
+\import Logic.Meta
+\import Paths
+\import Paths.Meta
+\import Set
+\import Data.Maybe
+\import Data.List
+\import Arith.Nat
+\import Meta
+
+-- =================================================================================
+-- Pos: positive binary numbers (same role as `positive` in stdpp)
+--
+--   xH      represents 1
+--   xO p    represents 2 * p     (append a 0 bit on the right)
+--   xI p    represents 2 * p + 1 (append a 1 bit on the right)
+-- =================================================================================
+
+-- | Positive binary numbers used as map keys. A `Pos` is a non-empty bit string
+-- | read most-significant-bit-last: `xH` is the terminator (value 1), `xO`
+-- | prepends a `0` bit (multiply by 2), `xI` prepends a `1` bit (multiply by 2,
+-- | add 1). The bit structure doubles as a path into the radix tree.
+\data Pos
+  | xH
+  | xO (p : Pos)
+  | xI (p : Pos)
+
+-- | Decidable equality on `Pos`. Proceeds by simultaneous case analysis on both
+-- | numbers: equal head constructors recurse and reuse the sub-decision, while
+-- | mismatched constructors are discriminated by a vacuous case on the would-be
+-- | equality. Needed wherever lookups must branch on key (in)equality.
+\func Pos_eq_dec (p q : Pos) : Dec (p = q) \elim p, q
+  | xH, xH => yes idp
+  | xH, xO _ => no (\lam e => \case e \with {})
+  | xH, xI _ => no (\lam e => \case e \with {})
+  | xO _, xH => no (\lam e => \case e \with {})
+  | xI _, xH => no (\lam e => \case e \with {})
+  | xO _, xI _ => no (\lam e => \case e \with {})
+  | xI _, xO _ => no (\lam e => \case e \with {})
+  | xO p, xO q => \case Pos_eq_dec p q \with {
+    | yes e => yes (pmap xO e)
+    | no  ne => no (\lam e => ne (pmap pred_xO e))
+  }
+  | xI p, xI q => \case Pos_eq_dec p q \with {
+    | yes e => yes (pmap xI e)
+    | no  ne => no (\lam e => ne (pmap pred_xI e))
+  }
+  \where {
+    -- | Strip a leading `xO`, returning the predecessor bit string. Used to turn
+    -- | an equality `xO p = xO q` back into `p = q` (injectivity of `xO`).
+    \func pred_xO (p : Pos) : Pos \elim p
+      | xH => xH
+      | xO p => p
+      | xI p => p
+
+    -- | Strip a leading `xI`, the analogue of `pred_xO` witnessing injectivity
+    -- | of `xI`.
+    \func pred_xI (p : Pos) : Pos \elim p
+      | xH => xH
+      | xO p => p
+      | xI p => p
+  }
+
+-- =================================================================================
+-- The raw radix tree
+-- =================================================================================
+
+-- | The raw (possibly non-canonical) radix tree carrying values of type `A`. A
+-- | node holds an optional value at the current key together with its left
+-- | (`xO`) and right (`xI`) subtrees. Multiple raw trees can denote the same
+-- | finite map; canonicity is imposed separately by `Pmap_wf`.
+\data Pmap' (A : \Set)
+  | PEmpty
+  | PNode (val : Maybe A) (left right : Pmap' A)
+
+-- =================================================================================
+-- Lookup on the raw tree
+--
+-- Convention:
+--   key xH        -> the value at the current node
+--   key (xO q)    -> recurse left with key q
+--   key (xI q)    -> recurse right with key q
+-- =================================================================================
+
+-- | Look up key `k` in a raw tree. The key's bits steer the descent: `xH` reads
+-- | the value stored at the current node, `xO q` recurses into the left child,
+-- | `xI q` into the right child; an exhausted (`PEmpty`) tree yields `nothing`.
+\func plookup' {A : \Set} (m : Pmap' A) (k : Pos) : Maybe A \elim m, k
+  | PEmpty, _ => nothing
+  | PNode v _ _, xH => v
+  | PNode _ l _, xO q => plookup' l q
+  | PNode _ _ r, xI q => plookup' r q
+
+-- =================================================================================
+-- Canonicity: a tree is well-formed iff it has no useless `PNode nothing PEmpty PEmpty`
+--
+-- This is what makes propositional equality the right notion of map equality.
+-- =================================================================================
+
+-- | Well-formedness (canonicity) invariant: both subtrees are well-formed and
+-- | the node is not the redundant leaf `PNode nothing PEmpty PEmpty`. Landing in
+-- | `\Prop`, it is proof-irrelevant, which is what lets `pmap'_eq` upgrade
+-- | pointwise lookup equality to propositional tree equality.
+\func Pmap_wf {A : \Set} (m : Pmap' A) : \Prop \elim m
+  | PEmpty => \Sigma
+  | PNode v l r => \Sigma
+    (Pmap_wf l)
+    (Pmap_wf r)
+  -- forbid the redundant shape `PNode nothing PEmpty PEmpty`
+    (PNode_nontrivial v l r)
+  \where {
+    -- | The local non-triviality condition: a node carries information unless it
+    -- | is exactly `nothing` over two empty subtrees, in which case it is
+    -- | `Empty` (forbidden). All other shapes are trivially allowed.
+    \func PNode_nontrivial {A : \Set} (v : Maybe A) (l r : Pmap' A) : \Prop \elim v, l, r
+      | nothing, PEmpty, PEmpty => Empty
+      | _, _, _ => \Sigma
+  }
+
+-- =================================================================================
+-- The "smart constructor": builds PNode but collapses the redundant case
+-- =================================================================================
+
+-- | Smart constructor for nodes: behaves like `PNode` except it collapses the
+-- | redundant `nothing`-over-two-empties case to `PEmpty`. Using this everywhere
+-- | preserves canonicity automatically.
+\func PNode' {A : \Set} (v : Maybe A) (l r : Pmap' A) : Pmap' A \elim v, l, r
+  | nothing, PEmpty, PEmpty => PEmpty
+  | v, l, r => PNode v l r
+
+-- The smart constructor preserves wellformedness.
+-- | `PNode'` produces a well-formed tree from well-formed subtrees: the only
+-- | shape that could violate canonicity is precisely the one `PNode'` collapses.
+\lemma PNode'_wf {A : \Set} (v : Maybe A) (l r : Pmap' A)
+                 (hl : Pmap_wf l) (hr : Pmap_wf r) : Pmap_wf (PNode' v l r)
+\elim v, l, r
+  | nothing, PEmpty, PEmpty => ()
+  | nothing, PEmpty, PNode _ _ _ => (hl, hr, ())
+  | nothing, PNode _ _ _, _ => (hl, hr, ())
+  | just _, _, _ => (hl, hr, ())
+
+-- And the smart constructor agrees with PNode at the lookup level.
+-- | `PNode'` is observationally equal to `PNode` at every key: collapsing the
+-- | redundant leaf never changes any lookup (the only collapsed value was
+-- | `nothing`). This bridges proofs about `PNode'` to proofs about `PNode`.
+\lemma plookup'_PNode' {A : \Set} (v : Maybe A) (l r : Pmap' A) (k : Pos)
+  : plookup' (PNode' v l r) k = plookup' (PNode v l r) k
+\elim v, l, r, k
+  | nothing, PEmpty, PEmpty, xH => idp
+  | nothing, PEmpty, PEmpty, xO _ => idp
+  | nothing, PEmpty, PEmpty, xI _ => idp
+  | nothing, PEmpty, PNode _ _ _, _ => idp
+  | nothing, PNode _ _ _, _, _ => idp
+  | just _, _, _, _ => idp
+
+-- =================================================================================
+-- partial_alter on the raw tree
+--
+-- partial_alter' f k m  =  modify the value at key k by f
+-- =================================================================================
+
+-- | The fundamental update primitive on raw trees: apply `f` to the current
+-- | (optional) value at key `k`, creating any missing nodes along the path and
+-- | using `PNode'` to keep the result canonical. `insert`/`delete`/`alter` are
+-- | all instances of this single operation, exactly as in stdpp.
+\func partial_alter' {A : \Set} (f : Maybe A -> Maybe A) (k : Pos) (m : Pmap' A) : Pmap' A \elim k, m
+  | xH,  PEmpty       => PNode' (f nothing) PEmpty PEmpty
+  | xO q, PEmpty      => PNode' nothing (partial_alter' f q PEmpty) PEmpty
+  | xI q, PEmpty      => PNode' nothing PEmpty (partial_alter' f q PEmpty)
+  | xH,  PNode v l r  => PNode' (f v) l r
+  | xO q, PNode v l r => PNode' v (partial_alter' f q l) r
+  | xI q, PNode v l r => PNode' v l (partial_alter' f q r)
+
+-- | `partial_alter'` preserves canonicity, since every node it builds goes
+-- | through the smart constructor `PNode'`. Proof is by structural recursion on
+-- | the key and tree, threading `PNode'_wf` through each step.
+\lemma partial_alter'_wf {A : \Set} (f : Maybe A -> Maybe A) (k : Pos) (m : Pmap' A)
+                         (hm : Pmap_wf m) : Pmap_wf (partial_alter' f k m)
+\elim k, m
+  | xH,  PEmpty => PNode'_wf (f nothing) PEmpty PEmpty () ()
+  | xO q, PEmpty => PNode'_wf nothing (partial_alter' f q PEmpty) PEmpty
+      (partial_alter'_wf f q PEmpty ()) ()
+  | xI q, PEmpty => PNode'_wf nothing PEmpty (partial_alter' f q PEmpty)
+      () (partial_alter'_wf f q PEmpty ())
+  | xH,  PNode v l r => PNode'_wf (f v) l r hm.1 hm.2
+  | xO q, PNode v l r => PNode'_wf v (partial_alter' f q l) r
+      (partial_alter'_wf f q l hm.1) hm.2
+  | xI q, PNode v l r => PNode'_wf v l (partial_alter' f q r)
+      hm.1 (partial_alter'_wf f q r hm.2)
+
+-- Lookup laws for partial_alter on the raw tree.
+-- | "Hit" lookup law: looking up the altered key returns `f` applied to the old
+-- | value. Each step rewrites the smart constructor away via `plookup'_PNode'`
+-- | and recurses down the path the key prescribes.
+\lemma plookup'_partial_alter'_eq {A : \Set} (f : Maybe A -> Maybe A) (k : Pos) (m : Pmap' A)
+  : plookup' (partial_alter' f k m) k = f (plookup' m k)
+\elim k, m
+  | xH,  PEmpty => path (\lam i => plookup'_PNode' (f nothing) PEmpty PEmpty xH @ i)
+  | xO q, PEmpty =>
+    plookup'_PNode' nothing (partial_alter' f q PEmpty) PEmpty (xO q) *>
+    plookup'_partial_alter'_eq f q PEmpty
+  | xI q, PEmpty =>
+    plookup'_PNode' nothing PEmpty (partial_alter' f q PEmpty) (xI q) *>
+    plookup'_partial_alter'_eq f q PEmpty
+  | xH,  PNode v l r => plookup'_PNode' (f v) l r xH
+  | xO q, PNode v l r =>
+    plookup'_PNode' v (partial_alter' f q l) r (xO q) *>
+    plookup'_partial_alter'_eq f q l
+  | xI q, PNode v l r =>
+    plookup'_PNode' v l (partial_alter' f q r) (xI q) *>
+    plookup'_partial_alter'_eq f q r
+
+-- | "Miss" lookup law: altering key `k` leaves any other key `k'` unchanged.
+-- | The proof case-splits on the first bit where `k` and `k'` diverge; once the
+-- | paths split, the altered subtree is irrelevant to `k'`, and when they share
+-- | a prefix it recurses using injectivity of `xO`/`xI` to keep `k ≠ k'`.
+\lemma plookup'_partial_alter'_ne {A : \Set} (f : Maybe A -> Maybe A) (k k' : Pos)
+                                  (m : Pmap' A) (hne : Not (k = k'))
+  : plookup' (partial_alter' f k m) k' = plookup' m k'
+\elim k, k', m
+  | xH,  xH,    _ => absurd (hne idp)
+  | xH,  xO q', PEmpty => plookup'_PNode' (f nothing) PEmpty PEmpty (xO q')
+  | xH,  xI q', PEmpty => plookup'_PNode' (f nothing) PEmpty PEmpty (xI q')
+  | xH,  xO q', PNode v l r => plookup'_PNode' (f v) l r (xO q')
+  | xH,  xI q', PNode v l r => plookup'_PNode' (f v) l r (xI q')
+  | xO q, xH,    PEmpty => plookup'_PNode' nothing (partial_alter' f q PEmpty) PEmpty xH
+  | xI q, xH,    PEmpty => plookup'_PNode' nothing PEmpty (partial_alter' f q PEmpty) xH
+  | xO q, xH,    PNode v l r => plookup'_PNode' v (partial_alter' f q l) r xH
+  | xI q, xH,    PNode v l r => plookup'_PNode' v l (partial_alter' f q r) xH
+  | xO q, xI q', PEmpty => plookup'_PNode' nothing (partial_alter' f q PEmpty) PEmpty (xI q')
+  | xI q, xO q', PEmpty => plookup'_PNode' nothing PEmpty (partial_alter' f q PEmpty) (xO q')
+  | xO q, xI q', PNode v l r => plookup'_PNode' v (partial_alter' f q l) r (xI q')
+  | xI q, xO q', PNode v l r => plookup'_PNode' v l (partial_alter' f q r) (xO q')
+  | xO q, xO q', PEmpty =>
+    plookup'_PNode' nothing (partial_alter' f q PEmpty) PEmpty (xO q') *>
+    plookup'_partial_alter'_ne f q q' PEmpty (\lam e => hne (pmap xO e))
+  | xI q, xI q', PEmpty =>
+    plookup'_PNode' nothing PEmpty (partial_alter' f q PEmpty) (xI q') *>
+    plookup'_partial_alter'_ne f q q' PEmpty (\lam e => hne (pmap xI e))
+  | xO q, xO q', PNode v l r =>
+    plookup'_PNode' v (partial_alter' f q l) r (xO q') *>
+    plookup'_partial_alter'_ne f q q' l (\lam e => hne (pmap xO e))
+  | xI q, xI q', PNode v l r =>
+    plookup'_PNode' v l (partial_alter' f q r) (xI q') *>
+    plookup'_partial_alter'_ne f q q' r (\lam e => hne (pmap xI e))
+
+-- =================================================================================
+-- merge on the raw tree
+--
+-- merge' f m1 m2 combines two trees pointwise using f at every key.
+--
+-- We require f nothing nothing = nothing so the output stays finite.
+-- =================================================================================
+
+-- | Pointwise combination of two raw trees with a binary value-combiner `f`,
+-- | descending both trees in lockstep. This is the engine behind the CMRA
+-- | operation on `gmap`-style maps (`op`/`merge`): resources are combined key by
+-- | key. `PNode'` keeps the result canonical when `f` produces `nothing`.
+\func merge' {A B C : \Set} (f : Maybe A -> Maybe B -> Maybe C)
+             (m1 : Pmap' A) (m2 : Pmap' B) : Pmap' C \elim m1, m2
+  | PEmpty, PEmpty => PEmpty
+  | PEmpty, PNode v l r =>
+    PNode' (f nothing v) (merge' f PEmpty l) (merge' f PEmpty r)
+  | PNode v l r, PEmpty =>
+    PNode' (f v nothing) (merge' f l PEmpty) (merge' f r PEmpty)
+  | PNode v1 l1 r1, PNode v2 l2 r2 =>
+    PNode' (f v1 v2) (merge' f l1 l2) (merge' f r1 r2)
+
+-- | `merge'` preserves canonicity, again because every constructed node passes
+-- | through `PNode'`. Structural recursion on both trees, applying `PNode'_wf`.
+\lemma merge'_wf {A B C : \Set} (f : Maybe A -> Maybe B -> Maybe C)
+                 (m1 : Pmap' A) (m2 : Pmap' B)
+                 (h1 : Pmap_wf m1) (h2 : Pmap_wf m2)
+  : Pmap_wf (merge' f m1 m2)
+\elim m1, m2
+  | PEmpty, PEmpty => ()
+  | PEmpty, PNode v l r =>
+    PNode'_wf (f nothing v) (merge' f PEmpty l) (merge' f PEmpty r)
+        (merge'_wf f PEmpty l () h2.1) (merge'_wf f PEmpty r () h2.2)
+  | PNode v l r, PEmpty =>
+    PNode'_wf (f v nothing) (merge' f l PEmpty) (merge' f r PEmpty)
+        (merge'_wf f l PEmpty h1.1 ()) (merge'_wf f r PEmpty h1.2 ())
+  | PNode v1 l1 r1, PNode v2 l2 r2 =>
+    PNode'_wf (f v1 v2) (merge' f l1 l2) (merge' f r1 r2)
+        (merge'_wf f l1 l2 h1.1 h2.1)
+        (merge'_wf f r1 r2 h1.2 h2.2)
+
+-- Pointwise lookup law for merge', requiring f preserves "nothing on both sides".
+-- | Lookup commutes with `merge'`: each key's value is `f` applied to the two
+-- | input lookups. The hypothesis `f nothing nothing = nothing` handles the
+-- | doubly-empty case (and is what keeps the merged map finite).
+\lemma plookup'_merge' {A B C : \Set} (f : Maybe A -> Maybe B -> Maybe C)
+                       (hf : f nothing nothing = nothing)
+                       (m1 : Pmap' A) (m2 : Pmap' B) (k : Pos)
+  : plookup' (merge' f m1 m2) k = f (plookup' m1 k) (plookup' m2 k)
+\elim m1, m2, k
+  | PEmpty, PEmpty, xH => inv hf
+  | PEmpty, PEmpty, xO q => inv hf
+  | PEmpty, PEmpty, xI q => inv hf
+  | PEmpty, PNode v l r, xH =>
+    plookup'_PNode' (f nothing v) (merge' f PEmpty l) (merge' f PEmpty r) xH
+  | PEmpty, PNode v l r, xO q =>
+    plookup'_PNode' (f nothing v) (merge' f PEmpty l) (merge' f PEmpty r) (xO q) *>
+    plookup'_merge' f hf PEmpty l q
+  | PEmpty, PNode v l r, xI q =>
+    plookup'_PNode' (f nothing v) (merge' f PEmpty l) (merge' f PEmpty r) (xI q) *>
+    plookup'_merge' f hf PEmpty r q
+  | PNode v l r, PEmpty, xH =>
+    plookup'_PNode' (f v nothing) (merge' f l PEmpty) (merge' f r PEmpty) xH
+  | PNode v l r, PEmpty, xO q =>
+    plookup'_PNode' (f v nothing) (merge' f l PEmpty) (merge' f r PEmpty) (xO q) *>
+    plookup'_merge' f hf l PEmpty q
+  | PNode v l r, PEmpty, xI q =>
+    plookup'_PNode' (f v nothing) (merge' f l PEmpty) (merge' f r PEmpty) (xI q) *>
+    plookup'_merge' f hf r PEmpty q
+  | PNode v1 l1 r1, PNode v2 l2 r2, xH =>
+    plookup'_PNode' (f v1 v2) (merge' f l1 l2) (merge' f r1 r2) xH
+  | PNode v1 l1 r1, PNode v2 l2 r2, xO q =>
+    plookup'_PNode' (f v1 v2) (merge' f l1 l2) (merge' f r1 r2) (xO q) *>
+    plookup'_merge' f hf l1 l2 q
+  | PNode v1 l1 r1, PNode v2 l2 r2, xI q =>
+    plookup'_PNode' (f v1 v2) (merge' f l1 l2) (merge' f r1 r2) (xI q) *>
+    plookup'_merge' f hf r1 r2 q
+
+-- =================================================================================
+-- Extensionality on the raw tree
+--
+-- Two well-formed trees with identical lookup are definitionally equal.
+-- This is the key payoff of the canonicity invariant.
+-- =================================================================================
+
+-- Auxiliary: a well-formed tree whose lookup returns `nothing` for every key
+-- must already be `PEmpty`. We prove this by direct structural induction on
+-- the tree, *without* appealing to `pmap'_eq` — this breaks the previous
+-- mutual recursion that the termination checker couldn't handle.
+-- | A well-formed tree that looks up to `nothing` everywhere is literally
+-- | `PEmpty`. The proof recurses structurally into both subtrees (proving each
+-- | empty), then transports the canonicity witness `hwf.3` along the resulting
+-- | equalities until it reduces to `Empty`, from which the goal follows by
+-- | `absurd`. Standalone structural recursion avoids the termination issue of a
+-- | mutual recursion with `pmap'_eq`.
+\func pmap'_wf_empty {A : \Set} (m : Pmap' A)
+                     (hwf : Pmap_wf m)
+                     (hempty : \Pi (k : Pos) -> plookup' m k = nothing)
+  : m = PEmpty \elim m
+  | PEmpty => idp
+  | PNode v l r =>
+    \let
+      | hv : v = nothing => hempty xH
+      -- Recurse structurally on the subtrees `l` and `r`.
+      | hl : l = PEmpty =>
+        pmap'_wf_empty l hwf.1 (\lam k => hempty (xO k))
+      | hr : r = PEmpty =>
+        pmap'_wf_empty r hwf.2 (\lam k => hempty (xI k))
+      -- After rewriting (v, l, r) = (nothing, PEmpty, PEmpty), the
+      -- well-formedness witness `hwf.3 : PNode_nontrivial v l r` reduces
+      -- to `Empty`, from which we can prove anything (including PNode = PEmpty).
+      | step1 : Pmap_wf.PNode_nontrivial v l PEmpty =>
+        transport (\lam r' => Pmap_wf.PNode_nontrivial v l r') hr hwf.3
+      | step2 : Pmap_wf.PNode_nontrivial v PEmpty PEmpty =>
+        transport (\lam l' => Pmap_wf.PNode_nontrivial v l' PEmpty) hl step1
+      | step3 : Pmap_wf.PNode_nontrivial (nothing : Maybe A) PEmpty PEmpty =>
+        transport (\lam v' => Pmap_wf.PNode_nontrivial v' PEmpty PEmpty) hv step2
+      -- step3 : Empty   (the absurd case of PNode_nontrivial)
+    \in absurd step3
+
+-- | Extensionality for raw trees: two well-formed trees with identical lookup
+-- | at every key are propositionally equal. Mismatched-constructor cases are
+-- | discharged via `pmap'_wf_empty` (one side is empty everywhere, hence
+-- | `PEmpty`, contradicting the other being a `PNode`); the `PNode`/`PNode`
+-- | case recurses on the value and the two subtrees. This is the payoff of
+-- | canonicity and the basis for the wrapped `pmap_eq`.
+\lemma pmap'_eq {A : \Set} (m1 m2 : Pmap' A)
+                (h1 : Pmap_wf m1) (h2 : Pmap_wf m2)
+                (h : \Pi (k : Pos) -> plookup' m1 k = plookup' m2 k)
+  : m1 = m2
+\elim m1, m2
+  | PEmpty, PEmpty => idp
+  | PEmpty, PNode v l r =>
+    -- The PNode side is empty at every key, so it must be PEmpty — contradiction.
+    \case pmap'_wf_empty (PNode v l r) h2 (\lam k => inv (h k)) \with {}
+  | PNode v l r, PEmpty =>
+    \case pmap'_wf_empty (PNode v l r) h1 h \with {}
+  | PNode v1 l1 r1, PNode v2 l2 r2 =>
+    \let
+      | hv : v1 = v2 => h xH
+      | hl : l1 = l2 => pmap'_eq l1 l2 h1.1 h2.1 (\lam k => h (xO k))
+      | hr : r1 = r2 => pmap'_eq r1 r2 h1.2 h2.2 (\lam k => h (xI k))
+    \in path (\lam i => PNode (hv @ i) (hl @ i) (hr @ i))
+
+
+-- =================================================================================
+-- The wrapped, canonical Pmap
+-- =================================================================================
+
+-- | The public finite-map type: a raw tree bundled with a proof that it is
+-- | canonical. Because `Pmap_wf` is a proposition and canonical trees are
+-- | extensional, `Pmap A` behaves as a *discrete* set of finite maps determined
+-- | by their lookup function — the form Iris uses to build `gmap` CMRAs/OFEs.
+\record Pmap (A : \Set)
+  | tree : Pmap' A
+  | tree_wf : Pmap_wf tree
+
+-- Lookup is just the raw lookup.
+-- | Lookup on a `Pmap`, defined as raw lookup on the underlying tree. This is
+-- | the single observation that determines a map (see `pmap_eq`).
+\func plookup {A : \Set} (m : Pmap A) (k : Pos) : Maybe A => plookup' m.tree k
+
+-- =================================================================================
+-- Empty
+-- =================================================================================
+
+-- | The empty map, defined directly from `PEmpty`. Acts as the unit of the map
+-- | CMRA and the base case of `pmap_ind`.
+\func pempty {A : \Set} : Pmap A \cowith
+  | tree => PEmpty
+  | tree_wf => ()
+
+-- | The empty map returns `nothing` at every key.
+\lemma plookup_empty {A : \Set} (k : Pos) : plookup (pempty {A}) k = nothing \elim k
+  | xH => idp
+  | xO _ => idp
+  | xI _ => idp
+
+-- =================================================================================
+-- partial_alter
+-- =================================================================================
+
+-- | Wrapped `partial_alter`: apply `f` to the value at key `k`, carrying the
+-- | canonicity proof through `partial_alter'_wf`. The single primitive from
+-- | which `pinsert` and `pdelete` are derived.
+\func ppartial_alter {A : \Set} (f : Maybe A -> Maybe A) (k : Pos) (m : Pmap A) : Pmap A \cowith
+  | tree => partial_alter' f k m.tree
+  | tree_wf => partial_alter'_wf f k m.tree m.tree_wf
+
+-- | Wrapped "hit" law: the altered key reads back `f` of its old value.
+\lemma plookup_partial_alter_eq {A : \Set} (f : Maybe A -> Maybe A) (k : Pos) (m : Pmap A)
+  : plookup (ppartial_alter f k m) k = f (plookup m k)
+  => plookup'_partial_alter'_eq f k m.tree
+
+-- | Wrapped "miss" law: altering `k` leaves any distinct key `k'` unchanged.
+\lemma plookup_partial_alter_ne {A : \Set} (f : Maybe A -> Maybe A) (k k' : Pos)
+                                (m : Pmap A) (h : Not (k = k'))
+  : plookup (ppartial_alter f k m) k' = plookup m k'
+  => plookup'_partial_alter'_ne f k k' m.tree h
+
+-- =================================================================================
+-- merge
+-- =================================================================================
+
+-- | Wrapped pointwise `merge` of two maps with combiner `f`, carrying canonicity
+-- | via `merge'_wf`. The map-level CMRA composition lives here.
+\func pmerge {A B C : \Set} (f : Maybe A -> Maybe B -> Maybe C)
+             (m1 : Pmap A) (m2 : Pmap B) : Pmap C \cowith
+  | tree => merge' f m1.tree m2.tree
+  | tree_wf => merge'_wf f m1.tree m2.tree m1.tree_wf m2.tree_wf
+
+-- | Wrapped lookup law for `pmerge`: lookups distribute through `f`, given that
+-- | `f nothing nothing = nothing`.
+\lemma plookup_merge {A B C : \Set} (f : Maybe A -> Maybe B -> Maybe C)
+                     (hf : f nothing nothing = nothing)
+                     (m1 : Pmap A) (m2 : Pmap B) (k : Pos)
+  : plookup (pmerge f m1 m2) k = f (plookup m1 k) (plookup m2 k)
+  => plookup'_merge' f hf m1.tree m2.tree k
+
+-- =================================================================================
+-- Insert / delete / singleton
+-- =================================================================================
+
+-- | Insert (or overwrite) value `x` at key `k`, i.e. `partial_alter` with the
+-- | constant function `just x`.
+\func pinsert {A : \Set} (k : Pos) (x : A) (m : Pmap A) : Pmap A =>
+  ppartial_alter (\lam _ => just x) k m
+
+-- | Delete key `k`, i.e. `partial_alter` with the constant `nothing`.
+\func pdelete {A : \Set} (k : Pos) (m : Pmap A) : Pmap A =>
+  ppartial_alter (\lam _ => nothing) k m
+
+-- | The singleton map `{k ↦ x}`, an insert into `pempty`.
+\func psingleton {A : \Set} (k : Pos) (x : A) : Pmap A =>
+  pinsert k x pempty
+
+-- Standard lookup laws (immediate corollaries of partial_alter laws).
+-- | Looking up the just-inserted key returns the inserted value.
+\lemma plookup_insert_eq {A : \Set} (k : Pos) (x : A) (m : Pmap A)
+  : plookup (pinsert k x m) k = just x
+  => plookup_partial_alter_eq (\lam _ => just x) k m
+
+-- | Inserting at `k` does not change the value at any other key `k'`.
+\lemma plookup_insert_ne {A : \Set} (k k' : Pos) (x : A) (m : Pmap A) (h : Not (k = k'))
+  : plookup (pinsert k x m) k' = plookup m k'
+  => plookup_partial_alter_ne (\lam _ => just x) k k' m h
+
+-- | A deleted key reads back `nothing`.
+\lemma plookup_delete_eq {A : \Set} (k : Pos) (m : Pmap A)
+  : plookup (pdelete k m) k = nothing
+  => plookup_partial_alter_eq (\lam _ => nothing) k m
+
+-- | Deleting `k` leaves any other key `k'` unchanged.
+\lemma plookup_delete_ne {A : \Set} (k k' : Pos) (m : Pmap A) (h : Not (k = k'))
+  : plookup (pdelete k m) k' = plookup m k'
+  => plookup_partial_alter_ne (\lam _ => nothing) k k' m h
+
+-- | The singleton maps its key to its value.
+\lemma plookup_singleton_eq {A : \Set} (k : Pos) (x : A)
+  : plookup (psingleton k x) k = just x
+  => plookup_insert_eq k x pempty
+
+-- | The singleton `{k ↦ x}` returns `nothing` at any other key (combining
+-- | `plookup_insert_ne` with the emptiness of `pempty`).
+\lemma plookup_singleton_ne {A : \Set} (k k' : Pos) (x : A) (h : Not (k = k'))
+  : plookup (psingleton k x) k' = nothing
+  => plookup_insert_ne k k' x pempty h *> plookup_empty k'
+
+-- =================================================================================
+-- Extensionality at the wrapped level
+-- =================================================================================
+
+-- | Map extensionality: two maps with the same lookups everywhere are equal.
+-- | The underlying trees are equated by `pmap'_eq`, and the canonicity proofs
+-- | are matched automatically since `Pmap_wf` is a proposition (see
+-- | `pathOver_wf`). This is the central characterization of `Pmap` equality.
+\lemma pmap_eq {A : \Set} (m1 m2 : Pmap A)
+               (h : \Pi (k : Pos) -> plookup m1 k = plookup m2 k)
+  : m1 = m2 =>
+  \let teq : m1.tree = m2.tree => pmap'_eq m1.tree m2.tree m1.tree_wf m2.tree_wf h
+  \in path (\lam i => \new Pmap A {
+    | tree => teq @ i
+    | tree_wf => pathOver_wf m1 m2 teq @ i
+  })
+  \where {
+    -- Wf is a proposition (Pmap_wf lands in \Prop), so we can transport along teq.
+    -- | Builds the path over `teq` connecting the two canonicity witnesses, using
+    -- | proof-irrelevance of `Pmap_wf` (`prop-dpi`). This is what lets a single
+    -- | tree equality lift to a full `Pmap` equality.
+    \lemma pathOver_wf {A : \Set} (m1 m2 : Pmap A) (teq : m1.tree = m2.tree)
+      : Path (\lam i => Pmap_wf (teq @ i)) m1.tree_wf m2.tree_wf =>
+      prop-dpi (\lam i => Pmap_wf (teq @ i)) m1.tree_wf m2.tree_wf
+  }
+
+-- =================================================================================
+-- Functorial action: fmap and omap
+-- =================================================================================
+
+-- | Map a total function `f` over every stored value of a raw tree, preserving
+-- | the tree shape (it cannot delete entries, so plain `PNode` suffices). This
+-- | is the action witnessing that `Pmap` is a functor.
+\func pfmap_tree {A B : \Set} (f : A -> B) (m : Pmap' A) : Pmap' B \elim m
+  | PEmpty => PEmpty
+  | PNode v l r => PNode (option_map f v) (pfmap_tree f l) (pfmap_tree f r)
+  \where {
+    -- | Lift `f` to act on an optional value, leaving `nothing` fixed.
+    \func option_map {X Y : \Set} (g : X -> Y) (o : Maybe X) : Maybe Y \elim o
+      | nothing => nothing
+      | just x => just (g x)
+  }
+
+-- | `pfmap_tree` preserves canonicity: `option_map f` keeps the `nothing`/`just`
+-- | shape of values, so a node is non-trivial iff it was before mapping.
+\lemma pfmap_tree_wf {A B : \Set} (f : A -> B) (m : Pmap' A) (h : Pmap_wf m)
+  : Pmap_wf (pfmap_tree f m) \elim m
+  | PEmpty => ()
+  | PNode v l r =>
+    -- preserves nontriviality because option_map preserves nothing/just shape
+    \let
+      | hl : Pmap_wf (pfmap_tree f l) => pfmap_tree_wf f l h.1
+      | hr : Pmap_wf (pfmap_tree f r) => pfmap_tree_wf f r h.2
+    \in (hl, hr, fmap_nontrivial f v l r h.3)
+  \where {
+    -- | Non-triviality is preserved by `pfmap_tree`, because `option_map`
+    -- | preserves the `nothing`/`just` distinction and `pfmap_tree` preserves
+    -- | `PEmpty`/`PNode`.
+    \func fmap_nontrivial {A B : \Set} (f : A -> B) (v : Maybe A) (l r : Pmap' A)
+                          (h : Pmap_wf.PNode_nontrivial v l r)
+      : Pmap_wf.PNode_nontrivial (pfmap_tree.option_map f v) (pfmap_tree f l) (pfmap_tree f r)
+    \elim v, l, r
+      | nothing, PEmpty, PEmpty => h
+      | nothing, PEmpty, PNode _ _ _ => ()
+      | nothing, PNode _ _ _, _ => ()
+      | just _, _, _ => ()
+  }
+
+-- | Wrapped functorial map of `f` over all values of a `Pmap`.
+\func pfmap {A B : \Set} (f : A -> B) (m : Pmap A) : Pmap B \cowith
+  | tree => pfmap_tree f m.tree
+  | tree_wf => pfmap_tree_wf f m.tree m.tree_wf
+
+-- omap: like fmap, but values that map to `nothing` are removed; this is what
+-- you need for `pcore`-style operations on the gmap CMRA.
+-- | Partial map over values: apply `f : A -> Maybe B` and drop keys whose value
+-- | maps to `nothing`. Because entries can disappear, it uses the smart
+-- | constructor `PNode'` to stay canonical. This is the operation behind
+-- | `pcore`-style (filtering) actions on the `gmap` CMRA.
+\func pomap_tree {A B : \Set} (f : A -> Maybe B) (m : Pmap' A) : Pmap' B \elim m
+  | PEmpty => PEmpty
+  | PNode v l r => PNode' (option_bind f v) (pomap_tree f l) (pomap_tree f r)
+  \where {
+    -- | Monadic bind on `Maybe`: feed a present value through `g`, propagate
+    -- | `nothing`.
+    \func option_bind {X Y : \Set} (g : X -> Maybe Y) (o : Maybe X) : Maybe Y \elim o
+      | nothing => nothing
+      | just x => g x
+  }
+
+-- | `pomap_tree` preserves canonicity, since every node is rebuilt with
+-- | `PNode'`.
+\lemma pomap_tree_wf {A B : \Set} (f : A -> Maybe B) (m : Pmap' A) (h : Pmap_wf m)
+  : Pmap_wf (pomap_tree f m) \elim m
+  | PEmpty => ()
+  | PNode v l r =>
+    PNode'_wf (pomap_tree.option_bind f v) (pomap_tree f l) (pomap_tree f r)
+        (pomap_tree_wf f l h.1) (pomap_tree_wf f r h.2)
+
+-- | Wrapped partial map (`omap`) of `f` over a `Pmap`, deleting keys mapped to
+-- | `nothing`.
+\func pomap {A B : \Set} (f : A -> Maybe B) (m : Pmap A) : Pmap B \cowith
+  | tree => pomap_tree f m.tree
+  | tree_wf => pomap_tree_wf f m.tree m.tree_wf
+
+-- Pointwise lookup law for `pomap_tree`: looking up `k` in the mapped tree is the
+-- same as looking up `k` in the original and binding the result through `f`.
+-- | Raw lookup law for `pomap_tree`: looking up `k` after omap equals binding
+-- | the original lookup through `f`. Proof rewrites `PNode'` away and recurses
+-- | along the key's bits.
+\lemma plookup'_pomap_tree {A B : \Set} (f : A -> Maybe B) (m : Pmap' A) (k : Pos)
+  : plookup' (pomap_tree f m) k = pomap_tree.option_bind f (plookup' m k)
+\elim m, k
+  | PEmpty, xH    => idp
+  | PEmpty, xO _  => idp
+  | PEmpty, xI _  => idp
+  | PNode v l r, xH =>
+    plookup'_PNode' (pomap_tree.option_bind f v) (pomap_tree f l) (pomap_tree f r) xH
+  | PNode v l r, xO q =>
+    plookup'_PNode' (pomap_tree.option_bind f v) (pomap_tree f l) (pomap_tree f r) (xO q) *>
+    plookup'_pomap_tree f l q
+  | PNode v l r, xI q =>
+    plookup'_PNode' (pomap_tree.option_bind f v) (pomap_tree f l) (pomap_tree f r) (xI q) *>
+    plookup'_pomap_tree f r q
+
+-- Wrapped lookup law: `plookup (pomap f m) k = option_bind f (plookup m k)`.
+-- | Wrapped lookup law for `pomap`: `plookup (pomap f m) k = option_bind f
+-- | (plookup m k)`.
+\lemma plookup_pomap {A B : \Set} (f : A -> Maybe B) (m : Pmap A) (k : Pos)
+  : plookup (pomap f m) k = pomap_tree.option_bind f (plookup m k)
+  => plookup'_pomap_tree f m.tree k
+
+
+-- =================================================================================
+-- map_to_list and dom
+-- =================================================================================
+
+-- Bit-prepending helpers: when descending into the left/right subtree, every
+-- key collected there gets `xO`/`xI` prepended at the bit position we just
+-- consumed. Concretely, if a key q lives at depth d on the left subtree, its
+-- absolute key at the parent is the original key with an extra `xO` *outside*.
+-- We model this by post-composing: the absolute key is built bottom-up.
+--
+-- We use a continuation-style accumulator (Pos -> Pos) to avoid expensive
+-- recomputation. To keep this file simple we use the simple recursive variant.
+
+-- | Enumerate a raw tree as a list of (key, value) entries. The `prefix`
+-- | continuation reconstructs each absolute key from the relative position: it
+-- | is extended by `xO`/`xI` as the walk descends left/right, so that the value
+-- | at the current node is emitted under `prefix xH`.
+\func pmap_to_list_tree {A : \Set} (m : Pmap' A) (prefix : Pos -> Pos)
+  : List (\Sigma Pos A) \elim m
+  | PEmpty => nil
+  | PNode v l r =>
+    \let
+      | here_part : List (\Sigma Pos A) => \case v \with {
+        | nothing => nil
+        | just x  => (prefix xH, x) :: nil
+      }
+      | left_part  : List (\Sigma Pos A) =>
+        pmap_to_list_tree l (\lam q => prefix (xO q))
+      | right_part : List (\Sigma Pos A) =>
+        pmap_to_list_tree r (\lam q => prefix (xI q))
+    \in here_part ++ left_part ++ right_part
+
+-- | The entry list of a `Pmap` (stdpp's `map_to_list`), obtained by walking the
+-- | tree with the identity prefix.
+\func pmap_to_list {A : \Set} (m : Pmap A) : List (\Sigma Pos A) =>
+  pmap_to_list_tree m.tree (\lam k => k)
+
+-- | The domain of a map: the list of its keys, i.e. the first projections of
+-- | `pmap_to_list`.
+\func pdom {A : \Set} (m : Pmap A) : List Pos =>
+  list_map (\lam p => p.1) (pmap_to_list m)
+  \where {
+    -- | Standard `map` over lists, used to project keys out of the entry list.
+    \func list_map {X Y : \Set} (f : X -> Y) (l : List X) : List Y \elim l
+      | nil => nil
+      | :: x xs => f x :: list_map f xs
+  }
+
+-- =================================================================================
+-- Helper: lookup on the result of "fold pinsert over a list of entries"
+--
+-- Mirrors `lookup_list_to_map` from stdpp.
+-- =================================================================================
+
+-- | Rebuild a map by folding `pinsert` over a list of entries on top of a base
+-- | map `m` (stdpp's `list_to_map`). Entries earlier in the list win, since they
+-- | are inserted last.
+\func pinsert_list {A : \Set} (l : List (\Sigma Pos A)) (m : Pmap A) : Pmap A \elim l
+  | nil => m
+  | :: e l => pinsert e.1 e.2 (pinsert_list l m)
+
+-- "k does not appear in the first projection of l"
+-- | Proposition stating that key `k` does not occur among the keys of entry
+-- | list `l`.
+\func not_in_keys {A : \Set} (k : Pos) (l : List (\Sigma Pos A)) : \Prop \elim l
+  | nil => \Sigma
+  | :: e l => \Sigma (Not (e.1 = k)) (not_in_keys k l)
+
+-- "the first projections of l have no duplicates"
+-- | Proposition stating that the keys of entry list `l` are pairwise distinct
+-- | (no duplicate keys). The invariant ensuring `pinsert_list` faithfully
+-- | reconstructs a map.
+\func nodup_keys {A : \Set} (l : List (\Sigma Pos A)) : \Prop \elim l
+  | nil => \Sigma
+  | :: e l => \Sigma (not_in_keys e.1 l) (nodup_keys l)
+
+-- | If `(k, x)` occurs in a duplicate-free entry list `l`, then folding the list
+-- | onto `m` yields `just x` at `k`. The proof inducts on the membership
+-- | witness: the head case rewrites along the key/value equalities, and the tail
+-- | case uses `nodup_keys` to know the head key differs from `k`, so
+-- | `plookup_insert_ne` lets the recursion through.
+\lemma plookup_pinsert_list_in {A : \Set} (l : List (\Sigma Pos A)) (m : Pmap A)
+                               (k : Pos) (x : A)
+                               (hin : InEntry k x l)
+                               (hnd : nodup_keys l)
+  : plookup (pinsert_list l m) k = just x
+\elim l, hin
+  | :: e l, here_entry e_eq =>
+    transport (\lam k' => plookup (pinsert e.1 e.2 (pinsert_list l m)) k' = just e.2)
+        e_eq.1
+        (plookup_insert_eq e.1 e.2 (pinsert_list l m))
+      *> pmap just e_eq.2
+  | :: e l, there_entry hin' =>
+    \case Pos_eq_dec e.1 k \with {
+      | yes e_k => absurd (entry_in_not_in_keys k x l hin' (transport (\lam k' => not_in_keys k' l) e_k hnd.1))
+      | no  ne_k =>
+        plookup_insert_ne e.1 k e.2 (pinsert_list l m) ne_k *>
+        plookup_pinsert_list_in l m k x hin' hnd.2
+    }
+  \where {
+    -- | Membership of a (key, value) pair in an entry list, as an inductive
+    -- | relation: either it is the head, or it occurs in the tail.
+    \data InEntry {A : \Set} (k : Pos) (x : A) (l : List (\Sigma Pos A)) \elim l
+      | :: e l => here_entry  (\Sigma (e.1 = k) (e.2 = x))
+      | :: e l => there_entry (InEntry k x l)
+
+    -- | A key cannot both occur in `l` (as part of an entry) and satisfy
+    -- | `not_in_keys`; deriving `Empty` from this clash.
+    \func entry_in_not_in_keys {A : \Set} (k : Pos) (x : A) (l : List (\Sigma Pos A))
+                               (hin : InEntry k x l)
+                               (hnk : not_in_keys k l)
+      : Empty
+    \elim l, hin
+      | :: e l, here_entry e_eq => hnk.1 e_eq.1
+      | :: e l, there_entry hin' => entry_in_not_in_keys k x l hin' hnk.2
+  }
+
+-- | If key `k` does not occur in `l`, folding `l` onto `m` leaves `k`'s lookup
+-- | equal to its value in `m`. Inducts on `l`, using `plookup_insert_ne` at each
+-- | cons (the head key differs from `k` by hypothesis).
+\lemma plookup_pinsert_list_not_in {A : \Set} (l : List (\Sigma Pos A)) (m : Pmap A)
+                                   (k : Pos)
+                                   (hni : not_in_keys k l)
+  : plookup (pinsert_list l m) k = plookup m k
+\elim l
+  | nil => idp
+  | :: e l =>
+    plookup_insert_ne e.1 k e.2 (pinsert_list l m) hni.1 *>
+    plookup_pinsert_list_not_in l m k hni.2
+
+-- =================================================================================
+-- The list of all entries of m has the right lookups + no duplicates
+--
+-- We'd ideally prove these for `pmap_to_list` directly, but doing so in full
+-- requires reasoning about the prefix-passing in `pmap_to_list_tree`. To keep
+-- the proof short, we use a small bespoke "tree fold to list" that's tailored
+-- for this proof.
+-- =================================================================================
+
+-- Walk the tree and produce a list of (absolute_key, value) pairs given a
+-- function `to_abs : Pos -> Pos` that turns a relative key into the absolute one.
+-- | A second, proof-tailored enumeration of a raw tree to (absolute key, value)
+-- | pairs, using a `to_abs` continuation to recover absolute keys (cf.
+-- | `pmap_to_list_tree`). Kept separate to keep the `pmap_ind` obligations
+-- | tractable.
+\func entries_of_tree {A : \Set} (t : Pmap' A) (to_abs : Pos -> Pos)
+  : List (\Sigma Pos A) \elim t
+  | PEmpty => nil
+  | PNode v l r =>
+    \let
+      | here_e : List (\Sigma Pos A) => \case v \with {
+        | nothing => nil
+        | just x  => (to_abs xH, x) :: nil
+      }
+      | left_e : List (\Sigma Pos A) =>
+        entries_of_tree l (\lam q => to_abs (xO q))
+      | right_e : List (\Sigma Pos A) =>
+        entries_of_tree r (\lam q => to_abs (xI q))
+    \in here_e ++ left_e ++ right_e
+
+-- | The entry list of a `Pmap` produced by `entries_of_tree` with the identity
+-- | absolutizer.
+\func entries_of {A : \Set} (m : Pmap A) : List (\Sigma Pos A) =>
+  entries_of_tree m.tree (\lam k => k)
+
+-- =================================================================================
+-- Pmap_ind: induction principle, mirroring stdpp's map_ind.
+--
+-- The Rocq proof of `map_ind` does:
+--   1. m = list_to_map (map_to_list m)              [by canonicity]
+--   2. NoDup (map_to_list m).*1                     [by NoDup_fst_map_to_list]
+--   3. induct on `map_to_list m`, applying `step` once per cons.
+--
+-- We do the same: build `entries_of m`, prove its lookups match m's lookups
+-- and that its keys are NoDup, then walk it.
+-- =================================================================================
+
+-- | Induction principle for `Pmap`, mirroring stdpp's `map_ind`: to prove a
+-- | predicate `P` for all maps it suffices to prove it for `pempty` and to show
+-- | it is preserved by inserting a fresh key. The proof rebuilds any `m` as
+-- | `pinsert_list (entries_of m) pempty` (justified by extensionality plus the
+-- | lookup/`nodup` lemmas below), then walks that list applying `step`, and
+-- | transports `P` back along the rebuild equality. The two lemmas
+-- | `entries_of_lookup`/`entries_of_nodup` are the remaining obligations (left
+-- | as holes).
+\func pmap_ind {A : \Set} (P : Pmap A -> \Type)
+               (base : P pempty)
+               (step : \Pi (k : Pos) (x : A) (m : Pmap A)
+               -> plookup m k = nothing
+                   -> P m
+                   -> P (pinsert k x m))
+               (m : Pmap A) : P m =>
+  \let
+    -- (1) every Pmap can be re-built as `pinsert_list (entries_of m) pempty`
+    | l : List (\Sigma Pos A) => pmap_ind.entries_of m
+    | hnodup : nodup_keys l => pmap_ind.entries_of_nodup m
+    | hsame : \Pi (k : Pos) -> plookup (pinsert_list l pempty) k = plookup m k =>
+      pmap_ind.entries_of_lookup m
+    | rebuild_eq : pinsert_list l pempty = m =>
+      pmap_eq (pinsert_list l pempty) m hsame
+    -- (2) prove P holds for every "fold pinsert over a NoDup list" starting from pempty
+    | P_for_list : \Pi (l' : List (\Sigma Pos A))
+    -> nodup_keys l'
+        -> P (pinsert_list l' pempty) =>
+      pmap_ind.list_ind base step
+  \in transport P rebuild_eq (P_for_list l hnodup)
+  \where {
+    -- Walk the list and apply `step` once per element. The pre-condition
+    -- `lookup = nothing` is discharged by `plookup_pinsert_list_not_in`
+    -- using the NoDup invariant.
+    -- | Apply `step` once per list element, building `P (pinsert_list l pempty)`
+    -- | by recursion on `l`. The freshness precondition for each `step` is
+    -- | discharged via `plookup_pinsert_list_not_in` together with
+    -- | `plookup_empty`, using the `nodup_keys` invariant.
+    \func list_ind {A : \Set} {P : Pmap A -> \Type}
+                   (base : P pempty)
+                   (step : \Pi (k : Pos) (x : A) (m : Pmap A)
+                   -> plookup m k = nothing
+                       -> P m
+                       -> P (pinsert k x m))
+                   (l : List (\Sigma Pos A))
+                   (hnd : nodup_keys l)
+      : P (pinsert_list l pempty)
+    \elim l
+      | nil => base
+      | :: e l =>
+        \let
+          | ih : P (pinsert_list l pempty) => list_ind base step l hnd.2
+          | nf : plookup (pinsert_list l pempty) e.1 = nothing =>
+            plookup_pinsert_list_not_in l pempty e.1 hnd.1 *>
+            plookup_empty e.1
+        \in step e.1 e.2 (pinsert_list l pempty) nf ih
+
+    -- These two lemmas are the only non-trivial obligations remaining.
+    -- | Obligation (left as a hole): the rebuilt map `pinsert_list (entries_of m)
+    -- | pempty` has the same lookups as `m`. Corresponds to canonicity of
+    -- | `map_to_list`/`list_to_map` round-tripping in stdpp.
+    \func entries_of_lookup {A : \Set} (m : Pmap A) (k : Pos)
+      : plookup (pinsert_list (entries_of m) pempty) k = plookup m k => {?}
+
+    -- | Obligation (left as a hole): the keys produced by `entries_of` have no
+    -- | duplicates (stdpp's `NoDup_fst_map_to_list`).
+    \func entries_of_nodup {A : \Set} (m : Pmap A)
+      : nodup_keys (entries_of m) => {?}
+
+    -- | Local copy of `entries_of` used by `pmap_ind`'s obligations.
+    \func entries_of {A : \Set} (m : Pmap A) : List (\Sigma Pos A) =>
+      entries_of_tree m.tree (\lam k => k)
+  }
+
+-- =================================================================================
+-- A few convenient corollaries
+-- =================================================================================
+
+-- Empty extensional characterisation.
+-- | A map that looks up to `nothing` everywhere equals `pempty` (extensional
+-- | characterization of emptiness).
+\lemma pmap_eq_empty {A : \Set} (m : Pmap A)
+                     (h : \Pi (k : Pos) -> plookup m k = nothing)
+  : m = pempty
+  => pmap_eq m pempty (\lam k => h k *> inv (plookup_empty k))
+
+-- Insert with the same value already present is a no-op.
+-- | Re-inserting the value already stored at `k` is a no-op. Proved by
+-- | extensionality: at `k` both sides give `just x` (`plookup_insert_eq` and the
+-- | hypothesis), and at any other key `pinsert` does not interfere.
+\lemma pinsert_id {A : \Set} (k : Pos) (x : A) (m : Pmap A)
+                  (h : plookup m k = just x)
+  : pinsert k x m = m
+  => pmap_eq (pinsert k x m) m (\lam k' =>
+      \case Pos_eq_dec k k' \with {
+        | yes p =>
+          rewriteI p (plookup_insert_eq k x m *> inv h)
+        | no  np =>
+          plookup_insert_ne k k' x m np
+      })

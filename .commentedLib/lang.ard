@@ -1,0 +1,372 @@
+Now I have enough context. Here is the commented file:
+
+```
+-- | Module `lang` — the object language (a HeapLang-style call-by-value λ-calculus
+-- | with a mutable heap) over which the Iris program logic is built.
+-- |
+-- | It defines the syntax of values and expressions, capture-avoiding substitution,
+-- | the machine state (a heap mapping locations to values), and the small-step
+-- | head-reduction relation `PrimStep`. This plays the role of HeapLang in the Coq
+-- | Iris development: it is the concrete language instance whose `PrimStep` relation
+-- | drives the weakest-precondition / Hoare-triple program logic. Notable features:
+-- | recursive functions, booleans/integers/unit/locations as literals, pairs, sum
+-- | types (injections + case), arithmetic, and heap operations (alloc/load/store).
+-- |
+-- | The standard language-interface lemmas (`to_of_val`, `of_to_val`, `val_stuck`)
+-- | establish the value/expression coherence properties Iris requires of any language.
+
+\import Arith.Nat
+\import Arith.Int
+\import Data.Bool
+\import Data.List
+\import Data.Maybe
+\import Data.Or
+\import Set
+\import Logic
+\import Paths
+\import Paths.Meta
+\import Meta
+\import lib.gmap_cmra
+
+
+
+-- \func String => List Nat
+--
+-- \func stringDecEq (x y : String) : (x = y) `Or` (Not (x = y)) \elim x, y
+--   | nil, nil => inl idp
+--   | nil, :: _ _ => inr (\lam p => \case p \with {})
+--   | :: _ _, nil => inr (\lam p => \case p \with {})
+--   | :: a xs, :: b ys => \case decEqNat a b \with {
+--     | inl ab => \case stringDecEq xs ys \with {
+--       | inl xys => inl (pmap2 (::) ab xys)
+--       | inr nxys => inr (\lam p => nxys (pmap tail p))
+--     }
+--     | inr nab => inr (\lam p => nab (pmap headDef p))
+--   }
+--   \where {
+--     \func headDef (l : List Nat) : Nat
+--       | nil => 0
+--       | :: a _ => a
+--
+--     \func tail (l : List Nat) : List Nat
+--       | nil => nil
+--       | :: _ xs => xs
+--   }
+
+-- | Heap locations are modelled as natural numbers, used as keys into the heap map.
+\func Loc => Nat
+
+-- | Literals: the base values of the language — machine integers, booleans, the
+-- | unit value, and heap locations (the latter produced by `Alloc`).
+\data Lit
+  | LitInt (n : Int)
+  | LitBool (b : Bool)
+  | LitUnit
+  | LitLoc (l : Loc)
+
+-- | Values: the normal forms of the language (results of fully evaluated expressions).
+-- | Includes literals, (non-recursive) lambda closures, recursive closures, pairs, and
+-- | left/right injections into a sum type. Mutually defined with `Expr`.
+\data Value : \Set
+  | LitV (l : Lit)
+  | LamV (x : String) (body : Expr)
+  | RecV (f x : String) (body : Expr)
+  | PairV (v1 v2 : Value)
+  | InjLV (v : Value)
+  | InjRV (v : Value)
+
+-- | Expressions: the syntax of the object language. Covers values/variables, (recursive)
+-- | abstraction and application, conditionals, products (`Pair`/`Fst`/`Snd`), sums
+-- | (`InjL`/`InjR`/`Case`), arithmetic (`IsZero`/`Pred`/`Mul`/`Add`), and the heap
+-- | primitives `Load`/`Store`/`Alloc`. Mutually defined with `Value`.
+\data Expr : \Set
+  | Val (v : Value)
+  | Var (x : String)
+  | Lam (x : String) (body : Expr)
+  | Rec (f x : String) (body : Expr)
+  | App (e1 e2 : Expr)
+  | If (cond thenB elseB : Expr)
+  | Pair (e1 e2 : Expr)
+  | Fst (e : Expr)
+  | Snd (e : Expr)
+  | InjL (e : Expr)
+  | InjR (e : Expr)
+  | Case (e0 e1 e2 : Expr)
+  | IsZero (e : Expr)
+  | Pred (e : Expr)
+  | Mul (e1 e2 : Expr)
+  | Add (e1 e2 : Expr)
+  | Load (e : Expr)
+  | Store (e1 e2 : Expr)
+  | Alloc (e : Expr)
+
+-- | The machine state: a heap represented as a finite map (`Gmap`) from locations to
+-- | values. The `Countable Loc` instance supplies the decidable-equality / enumeration
+-- | structure the gmap requires of its key type.
+\record State (cnt : Countable Loc)
+  | heap : Gmap Loc cnt Value
+
+-- | Inject a value into expressions. The trivial coercion `Value -> Expr`.
+\func of_val (v : Value) : Expr => Val v
+
+-- | Partial projection `Expr -> Maybe Value`: returns `just v` exactly when the
+-- | expression is already a value `Val v`, and `nothing` otherwise.
+\func to_val (e : Expr) : Maybe Value
+  | Val v => just v
+  | _ => nothing
+
+-- | Capture-avoiding substitution `e[v/x]`: replace every free occurrence of variable
+-- | `x` by value `v` in `e`. Binders (`Lam`, `Rec`) shadow `x`, so substitution stops
+-- | descending once the bound name(s) coincide with `x`.
+\func subst (x : String) (v : Value) (e : Expr) : Expr \elim e
+  | Val w => Val w
+  | Var y => \case decideEq x y \with {
+    | inl _ => Val v
+    | inr _ => Var y
+  }
+  | Lam y body => \case decideEq x y \with {
+    | inl _ => Lam y body
+    | inr _ => Lam y (subst x v body)
+  }
+  | Rec f y body => \case decideEq x f \with {
+    | inl _ => Rec f y body
+    | inr _ => \case decideEq x y \with {
+      | inl _ => Rec f y body
+      | inr _ => Rec f y (subst x v body)
+    }
+  }
+  | App e1 e2 => App (subst x v e1) (subst x v e2)
+  | If cond thenB elseB => If (subst x v cond) (subst x v thenB) (subst x v elseB)
+  | Pair e1 e2 => Pair (subst x v e1) (subst x v e2)
+  | Fst e => Fst (subst x v e)
+  | Snd e => Snd (subst x v e)
+  | InjL e => InjL (subst x v e)
+  | InjR e => InjR (subst x v e)
+  | Case e0 e1 e2 => Case (subst x v e0) (subst x v e1) (subst x v e2)
+  | IsZero e => IsZero (subst x v e)
+  | Pred e => Pred (subst x v e)
+  | Mul e1 e2 => Mul (subst x v e1) (subst x v e2)
+  | Add e1 e2 => Add (subst x v e1) (subst x v e2)
+  | Alloc e => Alloc (subst x v e)
+  | Load e => Load (subst x v e)
+  | Store e1 e2 => Store (subst x v e1) (subst x v e2)
+  \where {
+    -- | Decidable equality on variable names, used to decide whether substitution
+    -- | should replace a variable or stop at a binder. Currently a hole `{?}`.
+    \func decideEq (x y : String) : (x = y) `Or` (Not (x = y)) => {?}
+  }
+
+-- | Decidable equality on natural numbers, returning a constructive proof of equality
+-- | or its negation. Used as the underlying equality for locations.
+\func decEqNat (n m : Nat) : (n = m) `Or` (Not (n = m))
+  | 0, 0 => inl idp
+  | 0, suc _ => inr (\lam p => \case p \with {})
+  | suc _, 0 => inr (\lam p => \case p \with {})
+  | suc n, suc m => \case decEqNat n m \with {
+    | inl eq => inl (pmap suc eq)
+    | inr neq => inr (\lam p => neq (pmap predNat p))
+  }
+  \where {
+    -- | Truncated predecessor, used to transport an equality `suc n = suc m` down to
+    -- | `n = m` and so derive a contradiction in the unequal case.
+    \func predNat (n : Nat) : Nat
+      | 0 => 0
+      | suc n => n
+  }
+
+-- | Update the heap at location `l` with value `v` (insert or overwrite). Thin wrapper
+-- | over `ginsert` on the underlying gmap; used by `Alloc` and `Store`.
+\func heap_update {cnt : Countable Loc} (h : Gmap Loc cnt Value) (l : Loc) (v : Value) : Gmap Loc cnt Value =>
+  ginsert l v h
+
+-- | `PrimStep e1 s1 e2 s2` — the small-step head-reduction relation: expression `e1`
+-- | in state `s1` reduces in one primitive step to `e2` in state `s2`. This is the core
+-- | operational semantics that the Iris weakest precondition is defined against. It is a
+-- | `\Prop` (proof-irrelevant) and `\truncated`: each constructor packages the redex
+-- | shape (`p1`), the contractum (`p2`), and the state change (`p3`) as equalities, so a
+-- | step is given by choosing a rule plus witnesses. The rules cover β-reduction for
+-- | both kinds of closures, conditionals, products, sums, the heap primitives, and
+-- | arithmetic; pure rules leave the state unchanged (`s2 = s1`).
+\truncated \data PrimStep (e1 : Expr) (s1 : State) (e2 : Expr) (s2 : State) : \Prop
+  -- | β-reduction of a (non-recursive) lambda applied to a value: substitute the argument.
+  | BetaS (x : String) (body : Expr) (v : Value)
+          (p1 : e1 = App (Val (LamV x body)) (Val v))
+          (p2 : e2 = subst x v body)
+          (p3 : s2 = s1)
+  -- | β-reduction of a recursive closure: substitute both the argument and the closure
+  -- | itself for the recursion variable `f`, enabling recursive calls.
+  | RecBetaS (f x : String) (body : Expr) (v : Value)
+             (p1 : e1 = App (Val (RecV f x body)) (Val v))
+             (p2 : e2 = subst x v (subst f (RecV f x body) body))
+             (p3 : s2 = s1)
+  -- | Evaluate a `Rec` expression to a recursive-closure value.
+  | RecS (f x : String) (body : Expr)
+         (p1 : e1 = Rec f x body)
+         (p2 : e2 = Val (RecV f x body))
+         (p3 : s2 = s1)
+  -- | Conditional on `true`: step to the then-branch.
+  | IfTrueS (t f : Expr)
+            (p1 : e1 = If (Val (LitV (LitBool true))) t f)
+            (p2 : e2 = t)
+            (p3 : s2 = s1)
+  -- | Conditional on `false`: step to the else-branch.
+  | IfFalseS (t f : Expr)
+             (p1 : e1 = If (Val (LitV (LitBool false))) t f)
+             (p2 : e2 = f)
+             (p3 : s2 = s1)
+  -- | First projection of a pair value.
+  | FstS (v1 v2 : Value)
+         (p1 : e1 = Fst (Val (PairV v1 v2)))
+         (p2 : e2 = Val v1)
+         (p3 : s2 = s1)
+  -- | Second projection of a pair value.
+  | SndS (v1 v2 : Value)
+         (p1 : e1 = Snd (Val (PairV v1 v2)))
+         (p2 : e2 = Val v2)
+         (p3 : s2 = s1)
+  -- | Form a pair value from two evaluated components.
+  | PairS (v1 v2 : Value)
+          (p1 : e1 = Pair (Val v1) (Val v2))
+          (p2 : e2 = Val (PairV v1 v2))
+          (p3 : s2 = s1)
+  -- | Inject a value into the left summand.
+  | InjLS (v : Value)
+          (p1 : e1 = InjL (Val v))
+          (p2 : e2 = Val (InjLV v))
+          (p3 : s2 = s1)
+  -- | Inject a value into the right summand.
+  | InjRS (v : Value)
+          (p1 : e1 = InjR (Val v))
+          (p2 : e2 = Val (InjRV v))
+          (p3 : s2 = s1)
+  -- | Case analysis on a left injection: apply the first branch to the carried value.
+  | CaseLS (v : Value) (br1 br2 : Expr)
+           (p1 : e1 = Case (Val (InjLV v)) br1 br2)
+           (p2 : e2 = App br1 (Val v))
+           (p3 : s2 = s1)
+  -- | Case analysis on a right injection: apply the second branch to the carried value.
+  | CaseRS (v : Value) (br1 br2 : Expr)
+           (p1 : e1 = Case (Val (InjRV v)) br1 br2)
+           (p2 : e2 = App br2 (Val v))
+           (p3 : s2 = s1)
+  -- | Allocation: pick a fresh location `l` (premise `fresh`: `l` is unmapped), bind it
+  -- | to `v`, and return the location. This is a stateful step that grows the heap.
+  | AllocS (v : Value) (l : Loc)
+           (fresh : glookup s1.heap l = nothing)
+           (p1 : e1 = Alloc (Val v))
+           (p2 : e2 = Val (LitV (LitLoc l)))
+           (p3 : s2 = \new State { | cnt => s1.cnt | heap => heap_update s1.heap l v })
+  -- | Dereference: read the value `v` stored at location `l` (premise `lookup`).
+  | LoadS (l : Loc) (v : Value)
+          (lookup : glookup s1.heap l = just v)
+          (p1 : e1 = Load (Val (LitV (LitLoc l))))
+          (p2 : e2 = Val v)
+          (p3 : s2 = s1)
+  -- | Assignment: overwrite an already-allocated location `l` (premise `allocated`) with
+  -- | `v`, returning unit and updating the heap.
+  | StoreS (l : Loc) (v v' : Value)
+           (allocated : glookup s1.heap l = just v')
+           (p1 : e1 = Store (Val (LitV (LitLoc l))) (Val v))
+           (p2 : e2 = Val (LitV LitUnit))
+           (p3 : s2 = \new State { | cnt => s1.cnt | heap => heap_update s1.heap l v })
+  -- | `IsZero` on the integer 0 yields `true`.
+  | IsZeroZeroS
+          (p1 : e1 = IsZero (Val (LitV (LitInt 0))))
+          (p2 : e2 = Val (LitV (LitBool true)))
+          (p3 : s2 = s1)
+  -- | `IsZero` on a strictly positive integer yields `false`.
+  | IsZeroPosS (n : Nat)
+               (p1 : e1 = IsZero (Val (LitV (LitInt (pos (suc n))))))
+               (p2 : e2 = Val (LitV (LitBool false)))
+               (p3 : s2 = s1)
+  -- | Predecessor of a positive integer `suc n` is `n` (only defined on positives here).
+  | PredS (n : Nat)
+          (p1 : e1 = Pred (Val (LitV (LitInt (pos (suc n))))))
+          (p2 : e2 = Val (LitV (LitInt (pos n))))
+          (p3 : s2 = s1)
+  -- | Multiplication of two non-negative integer literals.
+  | MulS (a b : Nat)
+         (p1 : e1 = Mul (Val (LitV (LitInt (pos a)))) (Val (LitV (LitInt (pos b)))))
+         (p2 : e2 = Val (LitV (LitInt (pos (a Nat.* b)))))
+         (p3 : s2 = s1)
+  -- | Addition of two integer literals, using the integer ring addition `IntRing.+`.
+  | AddS (a b : Int)
+         (p1 : e1 = Add (Val (LitV (LitInt a))) (Val (LitV (LitInt b))))
+         (p2 : e2 = Val (LitV (LitInt (a IntRing.+ b))))
+         (p3 : s2 = s1)
+
+-- | `Reducible e s` — expression `e` can take at least one primitive step in state `s`.
+-- | Defined as the propositional truncation of the existence of a successor configuration;
+-- | this is the "not stuck" / progress condition used in the weakest-precondition proofs.
+\func Reducible (e : Expr) (s : State) : \Prop =>
+  TruncP (\Sigma (e' : Expr) (s' : State) (PrimStep e s e' s'))
+
+-- | Round-trip lemma: turning a value into an expression and back recovers the value.
+-- | One of the coherence laws Iris requires of a language. Holds definitionally (`idp`).
+\func to_of_val (v : Value) : to_val (of_val v) = just v => idp
+
+-- | Round-trip lemma in the other direction: if `to_val e = just v` then `e` was already
+-- | `Val v`. Proved by case analysis on `e`; all non-`Val` cases are absurd since
+-- | `to_val` returns `nothing` there (refuted by `\case p \with {}`), and the `Val v'`
+-- | case extracts `v' = v` from the equality of the `Maybe`s.
+\func of_to_val (e : Expr) (v : Value) (p : to_val e = just v) : of_val v = e \elim e
+  | Val v' =>
+    \let eq : v' = v => pmap (\case \elim __ \with { | just x => x | nothing => v' }) p
+    \in pmap Val (inv eq)
+  | Var _ => \case p \with {}
+  | Lam _ _ => \case p \with {}
+  | App _ _ => \case p \with {}
+  | If _ _ _ => \case p \with {}
+  | Pair _ _ => \case p \with {}
+  | Fst _ => \case p \with {}
+  | Snd _ => \case p \with {}
+  | InjL _ => \case p \with {}
+  | InjR _ => \case p \with {}
+  | Case _ _ _ => \case p \with {}
+  | Add _ _ => \case p \with {}
+  | Alloc _ => \case p \with {}
+  | Load _ => \case p \with {}
+  | Store _ _ => \case p \with {}
+
+-- | "Values are stuck": if `e` steps, then `e` is not a value (`to_val e = nothing`).
+-- | This is the head-reduction analogue of the standard Iris `val_stuck` law; combined
+-- | with `to_of_val`/`of_to_val` it certifies the language interface. Proved by case
+-- | analysis on the step: each rule's premise `p1` fixes `e1` to a non-value redex, so
+-- | rewriting by `p1` makes `to_val` compute to `nothing` (`idp`).
+\func val_stuck (e : Expr) (s : State) (e' : Expr) (s' : State)
+                (step : PrimStep e s e' s') : to_val e = nothing \elim step
+  | BetaS x body v p1 p2 p3 => rewrite p1 idp
+  | RecBetaS f x body v p1 p2 p3 => rewrite p1 idp
+  | RecS f x body p1 p2 p3 => rewrite p1 idp
+  | IfTrueS t f p1 p2 p3 => rewrite p1 idp
+  | IfFalseS t f p1 p2 p3 => rewrite p1 idp
+  | FstS v1 v2 p1 p2 p3 => rewrite p1 idp
+  | SndS v1 v2 p1 p2 p3 => rewrite p1 idp
+  | PairS v1 v2 p1 p2 p3 => rewrite p1 idp
+  | InjLS v p1 p2 p3 => rewrite p1 idp
+  | InjRS v p1 p2 p3 => rewrite p1 idp
+  | CaseLS v br1 br2 p1 p2 p3 => rewrite p1 idp
+  | CaseRS v br1 br2 p1 p2 p3 => rewrite p1 idp
+  | AllocS v l fresh p1 p2 p3 => rewrite p1 idp
+  | LoadS l v lookup p1 p2 p3 => rewrite p1 idp
+  | StoreS l v v' allocated p1 p2 p3 => rewrite p1 idp
+  | IsZeroZeroS p1 p2 p3 => rewrite p1 idp
+  | IsZeroPosS n p1 p2 p3 => rewrite p1 idp
+  | PredS n p1 p2 p3 => rewrite p1 idp
+  | MulS a b p1 p2 p3 => rewrite p1 idp
+  | AddS a b p1 p2 p3 => rewrite p1 idp
+
+-- =================================================================================
+-- Mathematical factorial on Nat
+-- =================================================================================
+
+-- | The mathematical factorial on `Nat`, defined by primitive recursion. Useful as a
+-- | reference specification when verifying object-language factorial programs.
+\func nat_fact (n : Nat) : Nat
+  | 0      => 1
+  | suc n' => suc n' Nat.* nat_fact n'
+
+-- | Embed a natural number as a value: the non-negative integer literal `LitV (LitInt (pos n))`.
+-- | A convenience for building object-language numeric values from `Nat`.
+\func natV (n : Nat) : Value => LitV (LitInt (pos n))
+```

@@ -1,0 +1,564 @@
+\import Logic
+\import Logic.Meta
+\import Paths
+\import Set
+\import Data.Maybe
+\import Order.PartialOrder
+\import Arith.Nat
+\import interface
+\import cmra
+\import ofe
+\import uPred
+\import lang
+\import lib.gmap_cmra
+\import lib.heap
+
+
+
+-- | Module `updates`: update modalities for the Iris BI logic over `uPred(M)`.
+-- |
+-- | This module formalizes Iris's *basic update modality* `|==> P` (here `bupd`),
+-- | which expresses a frame-preserving update of the resources: from the current
+-- | ownership we may move to a new state satisfying `P` while keeping any frame
+-- | (the `yf` in the semantics) valid. Concretely, on `uPred(M)` the modality is
+-- | `mkProperBUpd` from `uPred.ard`, which quantifies over an arbitrary frame and
+-- | produces a new resource `a'` validating it.
+-- |
+-- | Contents:
+-- |   * `BUpd` / `BiBUpd` — the algebraic interface bundling `bupd` with its laws
+-- |     (intro, mono, trans, frame), mirroring Iris's `BiBUpd` typeclass.
+-- |   * `BIuPredMixin` — the full BI (bunched-implication) structure on `uPred(M)`:
+-- |     proofs that the propositional/quantifier/separation connectives satisfy the
+-- |     `BIMixin` axioms.
+-- |   * The semantic lemmas (`bupd_ne`, `bupd_mono`, `bupd_intro`, `bupd_trans`,
+-- |     `bupd_frame_r`) discharging the `bupd` axioms for `uPred(M)`, and the
+-- |     instances `UPredBUpd` / `UPredBiBUpd` packaging them.
+-- |     `bupd_extract_pure` and `bupd_later_iter_soundness` are the soundness
+-- |     ingredients used by Iris adequacy: a pure fact under any number of nested
+-- |     `bupd`/`later` modalities really holds.
+-- |   * Derived structural laws `bupd_frame_l` and `bupd_sep`.
+-- |
+-- | Commented-out blocks sketch the analogous *fancy update* `|={E1,E2}=>` (`FUpd`)
+-- | interface, kept for future development.
+
+
+-- =================================================================================
+-- Update Modalities for BI
+-- =================================================================================
+
+
+-- | Interface adding the basic update modality `bupd : P -> |==> P` to a BI base.
+-- | An `E -> E` operation on propositions; the laws live in `BiBUpd`.
+\class BUpd \extends BIBase
+  | bupd : E -> E
+
+-- \class FUpd (B : BIBase)
+--   | fupd : Nat -> Nat -> B.E -> B.E
+
+
+-- =================================================================================
+-- BUpd Mixin: Axioms for Basic Updates
+-- =================================================================================
+
+-- | The axioms of the basic update modality, bundled with the BI structure.
+-- | These are exactly Iris's `bupd` laws:
+-- |   * `bupd_intro`  : `P |- |==> P` (any state is reachable by the trivial update);
+-- |   * `bupd_mono`   : `bupd` is monotone w.r.t. entailment;
+-- |   * `bupd_trans`  : `|==> |==> P |- |==> P` (updates compose);
+-- |   * `bupd_frame_r`: `(|==> P) * R |- |==> (P * R)` (frame untouched resources).
+\class BiBUpd \extends BUpd, BIMixin {
+  | bi_bupd_mixin_bupd_intro (P : E) : P |- bupd P
+  | bi_bupd_mixin_bupd_mono (P Q : E) : (P |- Q) -> (bupd P) |- (bupd Q)
+  | bi_bupd_mixin_bupd_trans (P : E) : (bupd (bupd P)) |- (bupd P)
+  | bi_bupd_mixin_bupd_frame_r (P R : E) : ((bupd P) * R) |- (bupd (P * R))
+}
+
+
+-- | The BI structure on `uPred(M)`: proofs that the connectives defined in
+-- | `uPred.ard` satisfy every `BIMixin` axiom. This turns step-indexed, resource
+-- | monotone predicates over a unital CMRA `M` into a model of bunched-implication
+-- | logic, with `*`/`-*` the separating conjunction/magic wand, `emp` the unit, and
+-- | the usual intuitionistic connectives. The field proofs reason pointwise at step
+-- | index `n` and resource `a`, using CMRA validity/distance facts (`cmra_validN_*`,
+-- | `cmra_comm`, `cmra_assoc`, `ofe_dist_*`) and `upred_mono` to transport along
+-- | resource inclusion and step-index decrease.
+\instance BIuPredMixin (M : UCMRA) : BIMixin
+  | BIBase => BIuPred M
+  | bi_mixin_pure_intro phi P =>
+    \lam hphi n a _ _ => hphi
+  | bi_mixin_pure_elim phi P =>
+    \lam h n a hv hp => h hp n a hv ()
+  | bi_mixin_and_intro P Q R =>
+    \lam hPQ hPR n a hv hp =>
+        (hPQ n a hv hp, hPR n a hv hp)
+  | bi_mixin_and_elim_l P Q =>
+    \lam n a _ hpq => hpq.1
+  | bi_mixin_and_elim_r P Q =>
+    \lam n a _ hpq => hpq.2
+  | bi_mixin_or_intro_l P Q =>
+    \lam n a _ hp => byLeft hp
+  | bi_mixin_or_intro_r P Q =>
+    \lam n a _ hq => byRight hq
+  | bi_mixin_or_elim P Q R =>
+    \lam hPR hQR n a hv hpq => \case hpq \with {
+      | byLeft hp  => hPR n a hv hp
+      | byRight hq => hQR n a hv hq
+    }
+  | bi_mixin_impl_intro_r P Q R h =>
+    \lam n a hv hp m m_le_n b incl_a_b hv_b hq_b =>
+        h m b hv_b
+            (P.upred_mono n m a b hp incl_a_b m_le_n, hq_b)
+  | bi_mixin_impl_elim_l P Q R =>
+    \lam hPI n a hv hpq =>
+        hPI n a hv hpq.1 n <=-refl a
+            (inP (M.unit,
+                  transport (\lam w => M.dist n a w)
+                      (inv (ucmra_unit_right_id a))
+                      (M.ofe_dist_refl n a)))
+            hv hpq.2
+  | bi_mixin_forall_intro {A} P Phi =>
+    \lam h n a hv hp t => h t n a hv hp
+  | bi_mixin_forall_elim {A} Phi t =>
+    \lam n a _ h => h t
+  | bi_mixin_exist_intro {A} Phi t =>
+    \lam n a _ h => inP (t, h)
+  | bi_mixin_exist_elim {A} Phi Q =>
+    \lam h n a hv hex => \case hex \with {
+      | inP (t, ht) => h t n a hv ht
+    }
+  | bi_mixin_sep_mono P P' Q Q' =>
+    \lam hPP' hQQ' n a hv hsep => \case hsep \with {
+      | inP (a1, a2, dist_a, hp, hq) =>
+        \let
+          | hv_op : M.validN n (M.op a1 a2) => M.cmra_validN_ne n a (M.op a1 a2) dist_a hv
+          | hv_a1 : M.validN n a1 => M.cmra_validN_op_l n a1 a2 hv_op
+          | hv_a2 : M.validN n a2 => cmra_validN_op_r {M} n a1 a2 hv_op
+        \in inP (a1, a2, dist_a, hPP' n a1 hv_a1 hp, hQQ' n a2 hv_a2 hq)
+    }
+  | bi_mixin_emp_sep_1 P =>
+    \lam n a hv hp =>
+        inP (M.unit, a,
+             transport (\lam w => M.dist n a w) (inv (M.ucmra_unit_left_id a))
+                 (M.ofe_dist_refl n a),
+             inP (M.unit,
+                  transport (\lam w => M.dist n M.unit w)
+                      (inv (M.ucmra_unit_left_id M.unit))
+                      (M.ofe_dist_refl n M.unit)),
+             hp)
+  | bi_mixin_emp_sep_2 P =>
+    \lam n a hv hsep => \case hsep \with {
+      | inP (a1, a2, dist_a, _, hp) =>
+        \let
+          | dist_swap : M.dist n a (M.op a2 a1) =>
+            M.ofe_dist_trans n a (M.op a1 a2) (M.op a2 a1)
+                dist_a
+                (equiv_dist_n {M} (M.op a1 a2) (M.op a2 a1) (M.cmra_comm a1 a2) n)
+          | inclN_a2_a : inclN {M} {\new Op M.E { | op => M.op }} a2 n a =>
+            inP (a1, dist_swap)
+        \in P.upred_mono n n a2 a hp inclN_a2_a <=-refl
+    }
+  | bi_mixin_sep_comm P Q =>
+    \lam n a hv hsep => \case hsep \with {
+      | inP (a1, a2, dist_a, hp, hq) =>
+        inP (a2, a1,
+             M.ofe_dist_trans n a (M.op a1 a2) (M.op a2 a1)
+                 dist_a
+                 (equiv_dist_n {M} (M.op a1 a2) (M.op a2 a1) (M.cmra_comm a1 a2) n),
+             hq, hp)
+    }
+  | bi_mixin_sep_assoc P Q R =>
+    \lam n a hv hsep => \case hsep \with {
+      | inP (a1, a2, dist_a, hpq, hr) => \case hpq \with {
+        | inP (b1, b2, dist_a1, hp, hq) =>
+          \let
+            | dist_op : M.dist n (M.op a1 a2) (M.op (M.op b1 b2) a2) =>
+              M.cmra_op_ne_2 a2 n a1 (M.op b1 b2) dist_a1
+            | dist_a_op : M.dist n a (M.op (M.op b1 b2) a2) =>
+              M.ofe_dist_trans n a (M.op a1 a2) (M.op (M.op b1 b2) a2) dist_a dist_op
+            | dist_a_assoc : M.dist n a (M.op b1 (M.op b2 a2)) =>
+              transport (\lam w => M.dist n a w) (inv (M.cmra_assoc b1 b2 a2)) dist_a_op
+          \in inP (b1, M.op b2 a2, dist_a_assoc, hp,
+                   inP (b2, a2, M.ofe_dist_refl n (M.op b2 a2), hq, hr))
+      }
+    }
+  | bi_mixin_wand_intro P Q R h =>
+    \lam n a1 hv hp m m_le_n a2 hv_op hq =>
+        h m (M.op a1 a2) hv_op
+            (inP (a1, a2, M.ofe_dist_refl m (M.op a1 a2),
+                  P.upred_mono n m a1 a1 hp
+                      (inP (M.unit, transport (\lam w => M.dist m a1 w)
+                          (inv (ucmra_unit_right_id a1)) (M.ofe_dist_refl m a1)))
+                      m_le_n,
+                  hq))
+  | bi_mixin_wand_elim P Q =>
+    \lam n a hv hsep => \case hsep \with {
+      | inP (a1, a2, dist_a, hp, hwand) =>
+        \let
+          | hv_op : M.validN n (M.op a1 a2) =>
+            M.cmra_validN_ne n a (M.op a1 a2) dist_a hv
+          | dist_swap : M.dist n (M.op a1 a2) (M.op a2 a1) =>
+            equiv_dist_n {M} (M.op a1 a2) (M.op a2 a1) (M.cmra_comm a1 a2) n
+          | hv_swap : M.validN n (M.op a2 a1) =>
+            M.cmra_validN_ne n (M.op a1 a2) (M.op a2 a1) dist_swap hv_op
+          | hq_swap : Q.upred_holds n (M.op a2 a1) =>
+            hwand n <=-refl a1 hv_swap hp
+          | dist_a_swap : M.dist n a (M.op a2 a1) =>
+            M.ofe_dist_trans n a (M.op a1 a2) (M.op a2 a1) dist_a dist_swap
+          | inclN_swap_a : inclN {M} {\new Op M.E { | op => M.op }} (M.op a2 a1) n a =>
+            inP (M.unit,
+                 transport (\lam w => M.dist n a w)
+                     (inv (ucmra_unit_right_id (M.op a2 a1)))
+                     dist_a_swap)
+        \in Q.upred_mono n n (M.op a2 a1) a hq_swap inclN_swap_a <=-refl
+    }
+
+-- =================================================================================
+-- FUpd Mixin: Axioms for Fancy Updates
+-- =================================================================================
+
+
+-- \class BiFUpdMixin (B : BIMixin) (fup : FUpd B) {
+--   | bi_fupd_mixin_fupd_mask_subseteq (E1 E2 : Nat) :
+--     E2 <= E1 -> True {B} |- fupd E1 E2 (fupd E2 E1 emp)
+--
+--   | bi_fupd_mixin_except_0_fupd (E1 E2 : Nat) (P : B.E) :
+--     ((fupd E1 E2 P) || False) |- (fupd E1 E2 P)
+--
+--   | bi_fupd_mixin_fupd_mono (E1 E2 : Nat) (P Q : B.E) :
+--     (P |- Q) -> (fupd E1 E2 P) |- (fupd E1 E2 Q)
+--
+--   | bi_fupd_mixin_fupd_trans (E1 E2 E3 : Nat) (P : B.E) :
+--     (fupd E1 E2 (fupd E2 E3 P)) |- (fupd E1 E3 P)
+--
+--   | bi_fupd_mixin_fupd_frame_r (E1 E2 : Nat) (P R : B.E) :
+--     ((fupd E1 E2 P) * R) |- (fupd E1 E2 (P * R))
+-- }
+
+
+-- =================================================================================
+-- Bundled Update Classes
+-- =================================================================================
+
+
+-- \class BiFUpd (B : BIMixin) {
+--   | bi_fupd_fupd : FUpd B
+--   | bi_fupd_mixin : BiFUpdMixin B bi_fupd_fupd
+-- }
+
+-- \class BiBUpdFUpd (B : BIMixin) (Bu : BiBUpd B) (Fu : BiFUpd B) {
+--   | bupd_fupd (E : Nat) (P : B.E) :
+--     (Bu.bi_bupd_bupd.bupd P) |- (Fu.bi_fupd_fupd.fupd E E P)
+-- }
+
+
+-- =================================================================================
+-- BUpd laws
+-- =================================================================================
+
+
+-- \record BUpdNE {cnt : Countable Loc}
+--   | bupd       : ProperUPred (HeapCMRA Loc cnt Value) -> ProperUPred (HeapCMRA Loc cnt Value)
+--   | bupd_ne    : \Pi (n : Nat) (P Q : ProperUPred (HeapCMRA Loc cnt Value)) ->
+--       upredDist n P Q -> upredDist n (bupd P) (bupd Q)
+--   | bupd_mono  : \Pi (P Q : ProperUPred (HeapCMRA Loc cnt Value)) ->
+--       properUPred_ent P Q -> properUPred_ent (bupd P) (bupd Q)
+--   | bupd_trans : \Pi (P : ProperUPred (HeapCMRA Loc cnt Value)) ->
+--       properUPred_ent (bupd (bupd P)) (bupd P)
+--   | bupd_intro : \Pi (P : ProperUPred (HeapCMRA Loc cnt Value)) ->
+--       properUPred_ent P (bupd P)
+--   | bupd_frame_r : \Pi (P R : ProperUPred (HeapCMRA Loc cnt Value)) ->
+--       properUPred_ent (mkProperSep (bupd P) R) (bupd (mkProperSep P R))
+--   | bupd_extract_pure : \Pi (phi : \Prop) (n : Nat) (a : (HeapCMRA Loc cnt Value).E) ->
+--       validN {HeapCMRA Loc cnt Value} n a ->
+--           (bupd (mkProperPure phi)).upred_holds n a -> phi
+--   | bupd_later_iter_soundness :
+--   \Pi (k : Nat) (phi : \Prop) (a : (HeapCMRA Loc cnt Value).E) ->
+--       validN {HeapCMRA Loc cnt Value} k a ->
+--           (bupd_later_iter_fn bupd k (bupd (mkProperPure phi))).upred_holds k a -> phi
+
+
+
+-- | Builds the iterated modality `(|==> ▷)^k (|==> ⌜φ⌝)` used in Iris adequacy.
+-- | Starting from `P`, each step wraps the predicate in a `later` and then a basic
+-- | update: `k = 0` is `P`, and `suc k` is `mkProperBUpd (mkProperLater (... k ...))`.
+-- | This is the shape produced by running `k` program steps in the soundness proof.
+\func bupd_later_iter_fn {M : UCMRA}
+                         (k : Nat)
+                         (P : ProperUPred M)
+  : ProperUPred M \elim k
+  | 0     => P
+  | suc k => mkProperBUpd (mkProperLater (bupd_later_iter_fn k P))
+
+-- | Non-expansiveness of `bupd` on `uPred(M)`: if `P` and `Q` are `n`-equal then so
+-- | are `|==> P` and `|==> Q`. Proven by unfolding `mkProperBUpd` on both directions
+-- | and transporting the witness `a'` through `P`/`Q` `n`-equality, using that the
+-- | left operand of a valid composite is valid (`cmra_validN_op_l`).
+\lemma bupd_ne {M : UCMRA} (n : Nat) (P Q : ProperUPred M)
+  : upredDist n P Q -> upredDist n (mkProperBUpd P) (mkProperBUpd Q) =>
+  \lam hPQ m a m_le_n hv_a =>
+      (\lam hP k k_le_m yf hv_op =>
+           \case hP k k_le_m yf hv_op \with {
+             | inP (a', hv'_op, hp_a') =>
+               \let
+                 | k_le_n : k <= n => NatSemiring.<=∘ k_le_m m_le_n
+                 | hv_a' : M.validN k a' => M.cmra_validN_op_l k a' yf hv'_op
+                 | hq_a' : Q.upred_holds k a' => (hPQ k a' k_le_n hv_a').1 hp_a'
+               \in inP (a', hv'_op, hq_a')
+           },
+       \lam hQ k k_le_m yf hv_op =>
+           \case hQ k k_le_m yf hv_op \with {
+             | inP (a', hv'_op, hq_a') =>
+               \let
+                 | k_le_n : k <= n => NatSemiring.<=∘ k_le_m m_le_n
+                 | hv_a' : M.validN k a' => M.cmra_validN_op_l k a' yf hv'_op
+                 | hp_a' : P.upred_holds k a' => (hPQ k a' k_le_n hv_a').2 hq_a'
+               \in inP (a', hv'_op, hp_a')
+           })
+
+-- | Monotonicity: `P |- Q` implies `|==> P |- |==> Q`. The frame-preserving witness
+-- | `a'` produced for `|==> P` already satisfies `P`, hence `Q` by the entailment.
+\lemma bupd_mono {M : UCMRA} (P Q : ProperUPred M)
+  : properUPred_ent P Q -> properUPred_ent (mkProperBUpd P) (mkProperBUpd Q) =>
+  \lam hPQ n a hv hP k k_le_n yf hv_op =>
+      \case hP k k_le_n yf hv_op \with {
+        | inP (a', hv'_op, hp_a') =>
+          \let
+            | hv_a' : M.validN k a' => M.cmra_validN_op_l k a' yf hv'_op
+            | hq_a' : Q.upred_holds k a' => hPQ k a' hv_a' hp_a'
+          \in inP (a', hv'_op, hq_a')
+      }
+
+-- | Introduction: `P |- |==> P`. The trivial update keeps the resource `a` itself as
+-- | the witness, so the frame `yf` stays valid; `upred_mono` re-derives `P` at the
+-- | lower step index `k`.
+\lemma bupd_intro {M : UCMRA} (P : ProperUPred M)
+  : properUPred_ent P (mkProperBUpd P) =>
+  \lam n a hv hP k k_le_n yf hv_op =>
+      inP (a, hv_op,
+           P.upred_mono n k a a hP
+               (inP (M.unit,
+                     transport (\lam w => M.dist k a w)
+                         (inv (ucmra_unit_right_id a))
+                         (M.ofe_dist_refl k a)))
+               k_le_n)
+
+-- | Transitivity / idempotence: `|==> |==> P |- |==> P`. Run the outer update to get
+-- | a witness `a'` satisfying `|==> P`, then run that inner update against the same
+-- | frame `yf` to obtain a final witness `a''` satisfying `P`.
+\lemma bupd_trans {M : UCMRA} (P : ProperUPred M)
+  : properUPred_ent (mkProperBUpd (mkProperBUpd P)) (mkProperBUpd P) =>
+  \lam n a hv hPP k k_le_n yf hv_op =>
+      \case hPP k k_le_n yf hv_op \with {
+        | inP (a', hv'_op, hbupd_a') =>
+          \case hbupd_a' k <=-refl yf hv'_op \with {
+            | inP (a'', hv''_op, hp_a'') =>
+              inP (a'', hv''_op, hp_a'')
+          }
+      }
+
+-- | Framing: `(|==> P) * R |- |==> (P * R)`. The disjoint part `a2` owning `R` is
+-- | absorbed into the frame `M.op a2 yf` while updating `a1`; the resulting witness
+-- | `M.op a1' a2` then satisfies `P * R`. Associativity (`cmra_assoc`) reshuffles the
+-- | validity proofs between `(a1*a2)*yf` and `a1*(a2*yf)`.
+\lemma bupd_frame_r {M : UCMRA} (P R : ProperUPred M)
+  : properUPred_ent (mkProperSep (mkProperBUpd P) R) (mkProperBUpd (mkProperSep P R)) =>
+  \lam n a hv hsep => \case hsep \with {
+    | inP (a1, a2, dist_a, hbupd, hR) =>
+      \lam k k_le_n yf hv_op =>
+          \let
+            | dist_a_k : M.dist k a (M.op a1 a2) =>
+              M.ofe_dist_le n k a (M.op a1 a2) dist_a k_le_n
+            | dist_op_yf : M.dist k (M.op a yf) (M.op (M.op a1 a2) yf) =>
+              M.cmra_op_ne_2 yf k a (M.op a1 a2) dist_a_k
+            | hv_assoc_l : M.validN k (M.op (M.op a1 a2) yf) =>
+              M.cmra_validN_ne k (M.op a yf) (M.op (M.op a1 a2) yf) dist_op_yf hv_op
+            | hv_a1_a2yf : M.validN k (M.op a1 (M.op a2 yf)) =>
+              transport (M.validN k) (inv (M.cmra_assoc a1 a2 yf)) hv_assoc_l
+            | hP_step : TruncP (\Sigma (a1' : M.E)
+                                       (M.validN k (M.op a1' (M.op a2 yf)))
+                                       (P.upred_holds k a1')) =>
+              hbupd k k_le_n (M.op a2 yf) hv_a1_a2yf
+          \in \case hP_step \with {
+            | inP (a1', hv_a1'_a2yf, hP_a1') =>
+              \let
+                | hv_a1'a2_yf : M.validN k (M.op (M.op a1' a2) yf) =>
+                  transport (M.validN k) (M.cmra_assoc a1' a2 yf) hv_a1'_a2yf
+                | inclN_a2 : inclN {M} {\new Op M.E { | op => M.op }} a2 k a2 =>
+                  inP (M.unit,
+                       transport (\lam w => M.dist k a2 w)
+                           (inv (ucmra_unit_right_id a2))
+                           (M.ofe_dist_refl k a2))
+                | hR_k : R.upred_holds k a2 =>
+                  R.upred_mono n k a2 a2 hR inclN_a2 k_le_n
+                | hsep_new : (mkProperSep P R).upred_holds k (M.op a1' a2) =>
+                  inP (a1', a2,
+                       M.ofe_dist_refl k (M.op a1' a2),
+                       hP_a1', hR_k)
+              \in inP (M.op a1' a2, hv_a1'a2_yf, hsep_new)
+          }
+  }
+
+-- | Extracts a pure fact from a single basic update: if `|==> ⌜φ⌝` holds at a valid
+-- | resource, then `φ` holds in the metalogic. Instantiates the frame with the unit
+-- | `M.unit`; the update's witness carries the pure proof of `φ` directly.
+\lemma bupd_extract_pure {M : UCMRA} (phi : \Prop) (n : Nat) (a : M.E)
+  : M.validN n a -> (mkProperBUpd (mkProperPure phi)).upred_holds n a -> phi =>
+  \lam hv hbupd =>
+      \let
+        | hv_op : M.validN n (M.op a M.unit) =>
+          transport (M.validN n) (inv (ucmra_unit_right_id a)) hv
+      \in \case hbupd n <=-refl M.unit hv_op \with {
+        | inP (_, _, hphi) => hphi
+      }
+
+-- | Soundness of iterated updates-under-laters: if `(|==> ▷)^k (|==> ⌜φ⌝)` holds at
+-- | step `k` on a valid resource, then `φ` is true. This is the core lemma behind
+-- | Iris's adequacy theorem — stripping `k` layers of `later` is sound because each
+-- | layer drops the step index by one. Proven by induction on `k`: the base case is
+-- | `bupd_extract_pure`; the step runs the outer update, lowers the index past the
+-- | `later`, and recurses.
+\lemma bupd_later_iter_soundness
+  {M : UCMRA} (k : Nat) (phi : \Prop) (a : M.E)
+  : M.validN k a ->
+    (bupd_later_iter_fn k (mkProperBUpd (mkProperPure phi))).upred_holds k a -> phi
+\elim k
+  | 0     => \lam hv h => bupd_extract_pure phi 0 a hv h
+  | suc k => \lam hv h =>
+      \let
+        | hv_op : M.validN (suc k) (M.op a M.unit) =>
+          transport (M.validN (suc k)) (inv (ucmra_unit_right_id a)) hv
+      \in \case h (suc k) <=-refl M.unit hv_op \with {
+        | inP (a', hv'_op, hlater_a') =>
+          \let
+            | hv'_op_k : M.validN k (M.op a' M.unit) =>
+              M.cmra_validN_le (suc k) k (M.op a' M.unit) hv'_op (n<=sucn k)
+            | hv_a'  : M.validN k a' =>
+              M.cmra_validN_op_l k a' M.unit hv'_op_k
+            | h_k    : (bupd_later_iter_fn k (mkProperBUpd (mkProperPure phi))).upred_holds k a' =>
+              hlater_a'
+          \in bupd_later_iter_soundness k phi a' hv_a' h_k
+      }
+
+
+-- | Instance equipping `uPred(M)` with the basic update modality, realized by
+-- | `mkProperBUpd`. Provides `bupd` without yet asserting its laws.
+\instance UPredBUpd (M : UCMRA) : BUpd
+  | BIBase => BIuPred M
+  | bupd => mkProperBUpd
+
+-- | Instance witnessing that `uPred(M)` is a `BiBUpd`: it bundles the BI structure
+-- | (`BIuPredMixin`) with `bupd := mkProperBUpd` and discharges the four update
+-- | axioms via the lemmas above. This is the concrete model making the basic update
+-- | modality available throughout the Iris development.
+\instance UPredBiBUpd (M : UCMRA) : BiBUpd
+  | BIMixin => BIuPredMixin M
+  | bupd => mkProperBUpd
+  | bi_bupd_mixin_bupd_intro   => bupd_intro
+  | bi_bupd_mixin_bupd_mono    => bupd_mono
+  | bi_bupd_mixin_bupd_trans   => bupd_trans
+  | bi_bupd_mixin_bupd_frame_r => bupd_frame_r
+
+-- =================================================================================
+-- Basic Laws for BUpd
+-- =================================================================================
+
+
+-- \func bupd_intro {B : BIMixin} {Bu : BiBUpd B} (P : B.E) : P |- Bu.bi_bupd_bupd.bupd P
+--   => Bu.bi_bupd_mixin.bi_bupd_mixin_bupd_intro P
+--
+-- \func bupd_mono {B : BIMixin} {Bu : BiBUpd B} (P Q : B.E) (h : P |- Q)
+--   : (Bu.bi_bupd_bupd.bupd P) |- (Bu.bi_bupd_bupd.bupd Q)
+--   => Bu.bi_bupd_mixin.bi_bupd_mixin_bupd_mono P Q h
+--
+-- \func bupd_trans {B : BIMixin} {Bu : BiBUpd B} (P : B.E)
+--   : (Bu.bi_bupd_bupd.bupd (Bu.bi_bupd_bupd.bupd P)) |- (Bu.bi_bupd_bupd.bupd P)
+--   => Bu.bi_bupd_mixin.bi_bupd_mixin_bupd_trans P
+--
+-- \func bupd_frame_r {B : BIMixin} {Bu : BiBUpd B} (P R : B.E)
+--   : ((Bu.bi_bupd_bupd.bupd P) * R) |- (Bu.bi_bupd_bupd.bupd (P * R))
+--   => Bu.bi_bupd_mixin.bi_bupd_mixin_bupd_frame_r P R
+
+
+-- =================================================================================
+-- Derived Laws for BUpd
+-- =================================================================================
+
+
+-- | Left framing for `bupd`: `R * (|==> Q) |- |==> (R * Q)`. Derived from the
+-- | primitive right-framing axiom by commuting the separating conjunction on both
+-- | sides (`sep_comm_lemma`) and using monotonicity.
+\func bupd_frame_l {Bu : BiBUpd} (R Q : Bu.E)
+  : (R * bupd Q) |- bupd (R * Q)
+  => Bu.<=-transitive
+      (sep_comm_lemma R (bupd Q))
+      (Bu.<=-transitive
+          (bi_bupd_mixin_bupd_frame_r Q R)
+          (bi_bupd_mixin_bupd_mono (Q * R) (R * Q) (sep_comm_lemma Q R)))
+
+-- | Combining two updates: `(|==> P) * (|==> Q) |- |==> (P * Q)`. Frame `Q`'s update
+-- | out to the right, push it under the first update with `bupd_frame_l`, then
+-- | collapse the nested updates with transitivity.
+\func bupd_sep {Bu : BiBUpd} (P Q : Bu.E)
+  : (bupd P * bupd Q) |- bupd (P * Q)
+  => Bu.<=-transitive
+      (bi_bupd_mixin_bupd_frame_r P (bupd Q))
+      (Bu.<=-transitive
+          (bi_bupd_mixin_bupd_mono (P * bupd Q) (bupd (P * Q))
+              (bupd_frame_l P Q))
+          (bi_bupd_mixin_bupd_trans (P * Q)))
+
+
+-- =================================================================================
+-- Basic Laws for FUpd
+-- =================================================================================
+
+
+-- \func fupd_mask_subseteq {B : BIMixin} {Fu : BiFUpd B} (E1 E2 : Nat) (h : E2 <= E1)
+--   : True {B} |- Fu.bi_fupd_fupd.fupd E1 E2 (Fu.bi_fupd_fupd.fupd E2 E1 emp)
+--   => Fu.bi_fupd_mixin.bi_fupd_mixin_fupd_mask_subseteq E1 E2 h
+--
+-- \func fupd_mono {B : BIMixin} {Fu : BiFUpd B} (E1 E2 : Nat) (P Q : B.E) (h : P |- Q)
+--   : (Fu.bi_fupd_fupd.fupd E1 E2 P) |- (Fu.bi_fupd_fupd.fupd E1 E2 Q)
+--   => Fu.bi_fupd_mixin.bi_fupd_mixin_fupd_mono E1 E2 P Q h
+--
+-- \func fupd_trans {B : BIMixin} {Fu : BiFUpd B} (E1 E2 E3 : Nat) (P : B.E)
+--   : (Fu.bi_fupd_fupd.fupd E1 E2 (Fu.bi_fupd_fupd.fupd E2 E3 P)) |- (Fu.bi_fupd_fupd.fupd E1 E3 P)
+--   => Fu.bi_fupd_mixin.bi_fupd_mixin_fupd_trans E1 E2 E3 P
+--
+-- \func fupd_frame_r {B : BIMixin} {Fu : BiFUpd B} (E1 E2 : Nat) (P R : B.E)
+--   : ((Fu.bi_fupd_fupd.fupd E1 E2 P) * R) |- (Fu.bi_fupd_fupd.fupd E1 E2 (P * R))
+--   => Fu.bi_fupd_mixin.bi_fupd_mixin_fupd_frame_r E1 E2 P R
+
+
+-- =================================================================================
+-- Derived Laws for FUpd
+-- =================================================================================
+
+
+-- \func fupd_intro {B : BIMixin} {Fu : BiFUpd B} (E : Nat) (P : B.E)
+--   : P |- (Fu.bi_fupd_fupd.fupd E E P)
+--   => B.<=-transitive
+--       (B.bi_mixin_pure_intro (\Sigma) P ())
+--       (B.<=-transitive
+--         (fupd_mask_subseteq E E <=-refl)
+--         (B.<=-transitive
+--           (fupd_mono E E (Fu.bi_fupd_fupd.fupd E E emp) (Fu.bi_fupd_fupd.fupd E E P)
+--             (fupd_mono E E emp P (emp_sep_2_lemma P)))
+--           (fupd_trans E E E P)))
+--
+-- \func fupd_frame_l {B : BIMixin} {Fu : BiFUpd B} (E1 E2 : Nat) (R Q : B.E)
+--   : (R * (Fu.bi_fupd_fupd.fupd E1 E2 Q)) |- (Fu.bi_fupd_fupd.fupd E1 E2 (R * Q))
+--   => B.<=-transitive
+--       (sep_comm_lemma R (Fu.bi_fupd_fupd.fupd E1 E2 Q))
+--       (B.<=-transitive
+--         (fupd_frame_r E1 E2 Q R)
+--         (fupd_mono E1 E2 (Q * R) (R * Q) (sep_comm_lemma Q R)))
+--
+-- \func fupd_sep {B : BIMixin} {Fu : BiFUpd B} (E : Nat) (P Q : B.E)
+--   : ((Fu.bi_fupd_fupd.fupd E E P) * (Fu.bi_fupd_fupd.fupd E E Q)) |- (Fu.bi_fupd_fupd.fupd E E (P * Q))
+--   => B.<=-transitive
+--       (fupd_frame_r E E P (Fu.bi_fupd_fupd.fupd E E Q))
+--       (B.<=-transitive
+--         (fupd_mono E E (P * (Fu.bi_fupd_fupd.fupd E E Q)) (Fu.bi_fupd_fupd.fupd E E (P * Q))
+--           (fupd_frame_l E E P Q))
+--         (fupd_trans E E E (P * Q)))

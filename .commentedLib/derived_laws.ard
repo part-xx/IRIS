@@ -1,0 +1,309 @@
+Now I have enough understanding of the BI interface. Here is the commented file:
+
+-- | Derived laws of the BI (bunched-implication) logic, the higher-order
+-- | separation logic underlying Iris (uPred / the `bi` interface in Coq Iris).
+-- |
+-- | The `BIMixin` class in `interface` axiomatizes only the *primitive*
+-- | entailment rules of a BI: introduction/elimination for the additive
+-- | connectives (`&&`, `||`, `->>`, `forall`, `exists`, pure), the unit
+-- | constants (`True`, `False`), and the multiplicative/spatial connectives
+-- | (separating conjunction `*`, magic wand `-*`, `emp`). This module bundles
+-- | the standard *derived* consequences of those axioms: the "primed"
+-- | composable forms of the intro/elim rules, monotonicity (`_mono`) of every
+-- | connective, idempotence, commutativity, associativity, and the unit laws
+-- | (e.g. `True && P |- P`, `False || P |- P`). They are the everyday
+-- | building blocks for assembling larger proofs in the object logic, mirroring
+-- | the `bi/derived_laws.v` file of the Coq Iris development.
+\import interface
+\import Logic
+\import Order.PartialOrder
+
+
+
+
+-- | Left projection composed with a continuation: if `P |- R` then `P && Q |- R`.
+-- | The composable form of `bi_mixin_and_elim_l`.
+\lemma and_elim_l' {B : BIMixin} {P Q R : B.E} (h : P |- R) : P && Q |- R
+  => B.<=-transitive (B.bi_mixin_and_elim_l P Q) h
+
+-- | Right projection composed with a continuation: if `Q |- R` then `P && Q |- R`.
+-- | The composable form of `bi_mixin_and_elim_r`.
+\lemma and_elim_r' {B : BIMixin} {P Q R : B.E} (h : Q |- R) : P && Q |- R
+  => B.<=-transitive (B.bi_mixin_and_elim_r P Q) h
+
+-- | Left disjunction introduction precomposed: from `P |- Q` derive `P |- Q || R`.
+\lemma or_intro_l' {B : BIMixin} {P Q R : B.E} (h : P |- Q) : P |- Q || R
+  => B.<=-transitive h (B.bi_mixin_or_intro_l Q R)
+
+-- | Right disjunction introduction precomposed: from `P |- R` derive `P |- Q || R`.
+\lemma or_intro_r' {B : BIMixin} {P Q R : B.E} (h : P |- R) : P |- (Q || R)
+  => B.<=-transitive h (B.bi_mixin_or_intro_r Q R)
+
+
+-- | Existential introduction precomposed: given a witness `a` and `P |- Phi a`,
+-- | conclude `P |- exists A Phi`.
+\lemma exist_intro' {B : BIMixin} {A : \Set} {P : B.E} {Phi : A -> B.E} (a : A) (h : P |- (Phi a))
+  : P |- (exists A Phi)
+  => B.<=-transitive h (B.bi_mixin_exist_intro Phi a)
+
+-- | Universal elimination postcomposed: from `P |- forall A Phi` instantiate at
+-- | `a` to get `P |- Phi a`.
+\lemma forall_elim' {B : BIMixin} {A : \Set} {P : B.E} {Phi : A -> B.E} (h : P |- (forall A Phi)) (a : A)
+  : P |- (Phi a)
+  => B.<=-transitive h (B.bi_mixin_forall_elim Phi a)
+
+
+-- | Implication introduction with the hypothesis on the left: from `Q && P |- R`
+-- | derive `P |- Q ->> R`. Uses commutativity of `&&` to move `Q` into place.
+\lemma impl_intro_l {B : BIMixin} {P Q R : B.E} (h : (Q && P) |- R) : P |- (Q ->> R)
+  => B.bi_mixin_impl_intro_r P Q R (B.<=-transitive and_comm h)
+
+-- | Modus ponens / implication elimination: from `P |- Q ->> R` and `P |- Q`
+-- | conclude `P |- R`. Pairs the two hypotheses into `P |- (Q ->> R) && Q`, then
+-- | applies `impl_elim_l`.
+\lemma impl_elim {B : BIMixin} {P Q R : B.E} (h1 : P |- (Q ->> R)) (h2 : P |- Q) : P |- R
+  => B.<=-transitive (B.bi_mixin_and_intro P (Q ->> R) Q h1 h2) impl_elim_l
+
+-- | A "curry/uncurry" elimination: from `Q |- P ->> R` derive `P && Q |- R`.
+\lemma impl_elim_r' {B : BIMixin} {P Q R : B.E} (h : Q |- (P ->> R)) : (P && Q) |- R
+  => B.<=-transitive (and_mono (B.<=-refl {P}) h) impl_elim_r
+
+-- | Primitive elimination instance: `(P ->> Q) && P |- Q`, obtained from the
+-- | mixin rule `bi_mixin_impl_elim_l` applied to the reflexive entailment.
+\lemma impl_elim_l {B : BIMixin} {P Q : B.E} : ((P ->> Q) && P) |- Q
+  => B.bi_mixin_impl_elim_l (P ->> Q) P Q (B.<=-refl {P ->> Q})
+
+-- | Symmetric form of `impl_elim_l`: `P && (P ->> Q) |- Q`, via commutativity.
+\lemma impl_elim_r {B : BIMixin} {P Q : B.E} : (P && (P ->> Q)) |- Q
+  => B.<=-transitive and_comm impl_elim_l
+
+
+-- | Ex falso: `False` (the pure embedding of `Empty`) entails any `P`.
+\lemma False_elim {B : BIMixin} (P : B.E) : False |- P
+  => B.bi_mixin_pure_elim Empty P (\lam e => \case e \with {})
+
+-- | Top introduction: any `P` entails `True` (the pure embedding of the unit type).
+\lemma True_intro {B : BIMixin} (P : B.E) : P |- True
+  => B.bi_mixin_pure_intro (\Sigma) P ()
+
+
+-- | Monotonicity of `&&` in both arguments: from `P |- Q` and `P' |- Q'` derive
+-- | `P && P' |- Q && Q'`.
+\lemma and_mono {B : BIMixin} {P P' Q Q' : B.E} (h1 : P |- Q) (h2 : P' |- Q')
+  : (P && P') |- (Q && Q')
+  => B.bi_mixin_and_intro (P && P') Q Q' (and_elim_l' h1) (and_elim_r' h2)
+
+-- | Monotonicity of `&&` in its left argument only.
+\lemma and_mono_l {B : BIMixin} {P P' Q : B.E} (h : P |- Q) : (P && P') |- (Q && P')
+  => and_mono h (B.<=-refl {P'})
+
+-- | Monotonicity of `&&` in its right argument only.
+\lemma and_mono_r {B : BIMixin} {P P' Q' : B.E} (h : P' |- Q') : (P && P') |- (P && Q')
+  => and_mono (B.<=-refl {P}) h
+
+
+-- | Monotonicity of `||` in both arguments: from `P |- Q` and `P' |- Q'` derive
+-- | `P || P' |- Q || Q'`.
+\lemma or_mono {B : BIMixin} {P P' Q Q' : B.E} (h1 : P |- Q) (h2 : P' |- Q')
+  : (P || P') |- (Q || Q')
+  => B.bi_mixin_or_elim P P' (Q || Q') (or_intro_l' h1) (or_intro_r' h2)
+
+-- | Monotonicity of `||` in its left argument only.
+\lemma or_mono_l {B : BIMixin} {P P' Q : B.E} (h : P |- Q) : (P || P') |- (Q || P')
+  => or_mono h (B.<=-refl {P'})
+
+-- | Monotonicity of `||` in its right argument only.
+\lemma or_mono_r {B : BIMixin} {P P' Q' : B.E} (h : P' |- Q') : (P || P') |- (P || Q')
+  => or_mono (B.<=-refl {P}) h
+
+
+-- | Monotonicity of implication: contravariant in the premise (`Q |- P`) and
+-- | covariant in the conclusion (`P' |- Q'`), yielding `P ->> P' |- Q ->> Q'`.
+-- | Currently left as a hole (`{?}`).
+\lemma impl_mono {B : BIMixin} {P P' Q Q' : B.E} (h1 : Q |- P) (h2 : P' |- Q')
+  : (P ->> P') |- (Q ->> Q')
+  => {?}
+
+-- | Pointwise monotonicity of the universal quantifier: if `Phi a |- Psi a` for
+-- | every `a`, then `forall A Phi |- forall A Psi`.
+\lemma forall_mono {B : BIMixin} {A : \Set} {Phi Psi : A -> B.E} (h : \Pi (a : A) -> (Phi a) |- (Psi a))
+  : (forall A Phi) |- (forall A Psi)
+  => B.bi_mixin_forall_intro (forall A Phi) Psi (\lam a => B.<=-transitive (B.bi_mixin_forall_elim Phi a) (h a))
+
+-- | Pointwise monotonicity of the existential quantifier: if `Phi a |- Psi a` for
+-- | every `a`, then `exists A Phi |- exists A Psi`.
+\lemma exist_mono {B : BIMixin} {A : \Set} {Phi Psi : A -> B.E} (h : \Pi (a : A) -> (Phi a) |- (Psi a))
+  : (exists A Phi) |- (exists A Psi)
+  => B.bi_mixin_exist_elim Phi (exists A Psi) (\lam a => B.<=-transitive (h a) (B.bi_mixin_exist_intro Psi a))
+
+
+-- | Idempotence of `&&` (one direction): `P && P |- P`.
+\lemma and_idem {B : BIMixin} {P : B.E} : (P && P) |- P
+  => B.bi_mixin_and_elim_l P P
+
+-- | Idempotence of `&&` (reverse direction): `P |- P && P`, by diagonal introduction.
+\lemma and_idem-rev {B : BIMixin} {P : B.E} : P |- (P && P)
+  => B.bi_mixin_and_intro P P P B.<=-refl B.<=-refl
+
+-- | Idempotence of `||` (one direction): `P || P |- P`.
+\lemma or_idem {B : BIMixin} {P : B.E} : (P || P) |- P
+  => B.bi_mixin_or_elim P P P B.<=-refl B.<=-refl
+
+-- | Idempotence of `||` (reverse direction): `P |- P || P`.
+\lemma or_idem-rev {B : BIMixin} {P : B.E} : P |- (P || P)
+  => B.bi_mixin_or_intro_l P P
+
+
+-- | Commutativity of `&&`: `P && Q |- Q && P`. Built by re-introducing the
+-- | conjunction with the projections swapped.
+\lemma and_comm {B : BIMixin} {P Q : B.E} : (P && Q) |- (Q && P)
+  => B.bi_mixin_and_intro (P && Q) Q P (B.bi_mixin_and_elim_r P Q) (B.bi_mixin_and_elim_l P Q)
+
+-- | Commutativity of `||`: `P || Q |- Q || P`. Case-split on the disjunction and
+-- | reintroduce on the opposite side.
+\lemma or_comm {B : BIMixin} {P Q : B.E} : (P || Q) |- (Q || P)
+  => B.bi_mixin_or_elim P Q (Q || P) (B.bi_mixin_or_intro_r Q P) (B.bi_mixin_or_intro_l Q P)
+
+
+-- | Associativity of `&&` (one direction): `(P && Q) && R |- P && (Q && R)`.
+-- | Re-introduces the right-nested conjunction by composing the appropriate
+-- | left/right projections out of the left-nested one.
+\lemma and_assoc {B : BIMixin} {P Q R : B.E} : ((P && Q) && R) |- (P && (Q && R))
+  => B.bi_mixin_and_intro ((P && Q) && R) P (Q && R)
+    (and_elim_l' (B.bi_mixin_and_elim_l P Q))
+    (B.bi_mixin_and_intro ((P && Q) && R) Q R
+      (and_elim_l' (B.bi_mixin_and_elim_r P Q))
+      (B.bi_mixin_and_elim_r (P && Q) R))
+
+-- | Associativity of `&&` (reverse direction): `P && (Q && R) |- (P && Q) && R`.
+\lemma and_assoc-rev {B : BIMixin} {P Q R : B.E} : (P && (Q && R)) |- ((P && Q) && R)
+  => B.bi_mixin_and_intro (P && (Q && R)) (P && Q) R
+    (B.bi_mixin_and_intro (P && (Q && R)) P Q
+      (B.bi_mixin_and_elim_l P (Q && R))
+      (and_elim_r' (B.bi_mixin_and_elim_l Q R)))
+    (and_elim_r' (B.bi_mixin_and_elim_r Q R))
+
+-- | Associativity of `||` (one direction): `(P || Q) || R |- P || (Q || R)`.
+-- | Nested case-splits route each disjunct to the correct injection on the right.
+\lemma or_assoc {B : BIMixin} {P Q R : B.E} : ((P || Q) || R) |- (P || (Q || R))
+  => B.bi_mixin_or_elim (P || Q) R (P || (Q || R))
+    (B.bi_mixin_or_elim P Q (P || (Q || R))
+      (B.bi_mixin_or_intro_l P (Q || R))
+      (or_intro_r' (B.bi_mixin_or_intro_l Q R)))
+    (or_intro_r' (B.bi_mixin_or_intro_r Q R))
+
+-- | Associativity of `||` (reverse direction): `P || (Q || R) |- (P || Q) || R`.
+\lemma or_assoc-rev {B : BIMixin} {P Q R : B.E} : (P || (Q || R)) |- ((P || Q) || R)
+  => B.bi_mixin_or_elim P (Q || R) ((P || Q) || R)
+    (or_intro_l' (B.bi_mixin_or_intro_l P Q))
+    (B.bi_mixin_or_elim Q R ((P || Q) || R)
+      (or_intro_l' (B.bi_mixin_or_intro_r P Q))
+      (B.bi_mixin_or_intro_r (P || Q) R))
+
+
+-- | Left unit law for `&&`: `True && P |- P` (project out the right conjunct).
+\lemma True_and {B : BIMixin} {P : B.E} : (True && P) |- P
+  => B.bi_mixin_and_elim_r True P
+
+-- | Reverse left unit law for `&&`: `P |- True && P`.
+\lemma True_and-rev {B : BIMixin} {P : B.E} : P |- (True && P)
+  => B.bi_mixin_and_intro P True P (True_intro P) (B.<=-refl {P})
+
+-- | Right unit law for `&&`: `P && True |- P` (project out the left conjunct).
+\lemma and_True {B : BIMixin} {P : B.E} : (P && True) |- P
+  => B.bi_mixin_and_elim_l P True
+
+-- | Reverse right unit law for `&&`: `P |- P && True`.
+\lemma and_True-rev {B : BIMixin} {P : B.E} : P |- (P && True)
+  => B.bi_mixin_and_intro P P True (B.<=-refl {P}) (True_intro P)
+
+-- | Left unit law for `||`: `False || P |- P` (the `False` branch is vacuous).
+\lemma False_or {B : BIMixin} {P : B.E} : (False || P) |- P
+  => B.bi_mixin_or_elim False P P (False_elim P) (B.<=-refl {P})
+
+-- | Reverse left unit law for `||`: `P |- False || P`.
+\lemma False_or-rev {B : BIMixin} {P : B.E} : P |- (False || P)
+  => B.bi_mixin_or_intro_r False P
+
+-- | Right unit law for `||`: `P || False |- P`.
+\lemma or_False {B : BIMixin} {P : B.E} : (P || False) |- P
+  => B.bi_mixin_or_elim P False P (B.<=-refl {P}) (False_elim P)
+
+-- | Reverse right unit law for `||`: `P |- P || False`.
+\lemma or_False-rev {B : BIMixin} {P : B.E} : P |- (P || False)
+  => B.bi_mixin_or_intro_l P False
+
+
+-- | `False` is a left annihilator for `&&`: `False && P |- False`.
+\lemma False_and {B : BIMixin} {P : B.E} : (False && P) |- False
+  => B.bi_mixin_and_elim_l False P
+
+-- | Reverse direction: `False |- False && P` (ex falso supplies the `P` component).
+\lemma False_and-rev {B : BIMixin} {P : B.E} : False |- (False && P)
+  => B.bi_mixin_and_intro False False P (B.<=-refl {False}) (False_elim P)
+
+-- | `False` is a right annihilator for `&&`: `P && False |- False`.
+\lemma and_False {B : BIMixin} {P : B.E} : (P && False) |- False
+  => B.bi_mixin_and_elim_r P False
+
+-- | Reverse direction: `False |- P && False`.
+\lemma and_False-rev {B : BIMixin} {P : B.E} : False |- (P && False)
+  => B.bi_mixin_and_intro False P False (False_elim P) (B.<=-refl {False})
+
+-- | `True` is a left annihilator for `||`: `True || P |- True`.
+\lemma True_or {B : BIMixin} {P : B.E} : (True || P) |- True
+  => B.bi_mixin_or_elim True P True (B.<=-refl {True}) (True_intro P)
+
+-- | Reverse direction: `True |- True || P`.
+\lemma True_or-rev {B : BIMixin} {P : B.E} : True |- (True || P)
+  => B.bi_mixin_or_intro_l True P
+
+-- | `True` is a right annihilator for `||`: `P || True |- True`.
+\lemma or_True {B : BIMixin} {P : B.E} : (P || True) |- True
+  => B.bi_mixin_or_elim P True True (True_intro P) (B.<=-refl {True})
+
+-- | Reverse direction: `True |- P || True`.
+\lemma or_True-rev {B : BIMixin} {P : B.E} : True |- (P || True)
+  => B.bi_mixin_or_intro_r P True
+
+
+-- | Implication from `True` is just the conclusion: `(True ->> P) |- P`.
+-- | Pairs the hypothesis with `True` and applies modus ponens (`impl_elim_r`).
+\lemma True_impl {B : BIMixin} {P : B.E} : (True ->> P) |- P
+  => B.<=-transitive
+    (B.bi_mixin_and_intro (True ->> P) True (True ->> P) (True_intro (True ->> P)) (B.<=-refl {True ->> P}))
+    impl_elim_r
+
+-- | Reverse direction: `P |- True ->> P`, by discharging the trivial `True` hypothesis.
+\lemma True_impl-rev {B : BIMixin} {P : B.E} : P |- (True ->> P)
+  => impl_intro_l True_and
+
+-- | Reflexivity of implication as a weakened goal: any `Q` entails `P ->> P`.
+\lemma impl_refl {B : BIMixin} {P Q : B.E} : Q |- (P ->> P)
+  => impl_intro_l (B.bi_mixin_and_elim_l P Q)
+
+-- | An implication out of `False` is trivially true: `(False ->> P) |- True`.
+\lemma False_impl {B : BIMixin} {P : B.E} : (False ->> P) |- True
+  => True_intro (False ->> P)
+
+-- | Reverse direction: `True |- False ->> P`, since the `False` hypothesis is
+-- | absurd (ex falso) and yields any `P`.
+\lemma False_impl-rev {B : BIMixin} {P : B.E} : True |- (False ->> P)
+  => impl_intro_l (B.<=-transitive (B.bi_mixin_and_elim_l False True) (False_elim P))
+
+
+-- | Monotonicity of separating conjunction `*` in its left argument: from
+-- | `P |- Q` derive `P * P' |- Q * P'`.
+\lemma sep_mono_l {B : BIMixin} {P P' Q : B.E} (pf : P |- Q) : (P * P') |- (Q * P')
+  => B.bi_mixin_sep_mono P Q P' P' pf (B.<=-refl {P'})
+
+-- | Monotonicity of separating conjunction `*` in its right argument: from
+-- | `P' |- Q'` derive `P * P' |- P * Q'`.
+\lemma sep_mono_r {B : BIMixin} {P P' Q' : B.E} (pf : P' |- Q') : (P * P') |- (P * Q')
+  => B.bi_mixin_sep_mono P P P' Q' (B.<=-refl {P}) pf
+
+-- \lemma sep_comm {B : BIMixin} {P Q : B.E} : B.equiv (P * Q) (Q * P)
+--   => (B.bi_mixin_sep_comm P Q, B.bi_mixin_sep_comm Q P)
+--
+-- \lemma sep_False_r {B : BIMixin} {P : B.E} : B.equiv (P * False) False
+--   => (B.<=-transitive sep_comm.1 sep_False_l.1, B.<=-transitive sep_False_l.2 sep_comm.1)

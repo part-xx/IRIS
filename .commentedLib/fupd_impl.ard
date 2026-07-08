@@ -1,0 +1,3 @@
+`fupd_impl.ard` is an empty 0-byte placeholder, so there's nothing to comment. The actual fancy-update / weakest-precondition logic lives in non-empty modules: `updates.ard` (likely the fancy/basic updates), `weakestpre.ard`, and `adequacy.ard`.
+
+If you'd like, I can document one of those instead — just point me at the right file.

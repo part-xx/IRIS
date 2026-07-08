@@ -1,0 +1,359 @@
+The entire file is commented out (each line begins with `--`). Per the rules I'll keep every existing line byte-for-byte and insert `-- | …` doc-comment lines before the module and each definition.
+
+-- | Module `lib.agree_cmra`: the *agreement* CMRA `Ag(A)` over an arbitrary OFE `A`.
+-- | This is the Iris `agree` resource algebra: it lets several parties record and
+-- | *agree* on a value of `A`, while never giving up ownership (its core is the
+-- | identity, so the knowledge is freely duplicable). An element is represented by a
+-- | non-empty list of candidate values; the op is list concatenation (merge), and an
+-- | element is valid at step-index `n` iff all stored candidates are `n`-equivalent.
+-- | Contents: the membership predicate `In`, the carrier `AgreeElem`, the embedding
+-- | `to_agree`, the OFE structure `AgreeOFE`, the operation/validity/core, the full
+-- | `CMRA` instance `AgreeCMRA`, and the characteristic lemmas (`to_agree_ne`,
+-- | `to_agree_op_inv`, idempotence, commutativity) plus small list helpers.
+-- | NOTE: this whole module is currently commented out (see git history: "Removed the
+-- | agree cmra"); the doc-comments below document the intended definitions.
+-- \import Logic
+-- \import Logic.Meta
+-- \import Paths
+-- \import Paths.Meta
+-- \import Set
+-- \import Data.Maybe
+-- \import Data.List
+-- \import Arith.Nat
+-- \import Order.PartialOrder
+-- \import cmra
+-- \import ofe
+--
+--
+--
+-- | List membership: `In a l` is a proof that `a` occurs in `l`, either at the head
+-- | (`here`, with an equality witness) or somewhere in the tail (`there`).
+-- \data In {A : \Set} (a : A) (l : List A) \elim l
+--   | :: b l => here (a = b)
+--   | :: b l => there b (In a l)
+--
+--
+-- | Carrier of `Ag(A)`: a non-empty list of candidate values from `A`.
+-- | `agree_list` holds the candidates and `agree_not_nil` certifies the list is
+-- | inhabited (so the underlying multiset is never empty).
+-- \record AgreeElem (A : OFE)
+--   | agree_list : List A.E
+--   | agree_not_nil : \Sigma (a : A.E) (In a agree_list)
+--
+--
+-- | Canonical embedding `A -> Ag(A)`: wraps a single value `a` into the one-element
+-- | agreement `[a]`. This is Iris's `to_agree`.
+-- \func to_agree {A : OFE} (a : A.E) : AgreeElem A \cowith
+--   | agree_list => a :: nil
+--   | agree_not_nil => (a, here idp)
+--
+--
+-- | OFE structure on `AgreeElem A`. Two agreements are `n`-close when their candidate
+-- | lists are mutually `n`-approximable: every element of one is `n`-equivalent to some
+-- | element of the other, and vice versa (a step-indexed Hausdorff/set distance).
+-- \func AgreeOFE (A : OFE) : OFE \cowith
+--   | E => AgreeElem A
+--   | dist => \lam n x y =>
+--       \Sigma
+--         (\Pi (a : A.E) -> In a x.agree_list -> \Sigma (b : A.E) (In b y.agree_list) (A.dist n a b))
+--         (\Pi (b : A.E) -> In b y.agree_list -> \Sigma (a : A.E) (In a x.agree_list) (A.dist n a b))
+--
+--   -- | Equality vs. distance: forward direction transports the reflexive witness
+--   -- | along the equality `x = y`; backward direction uses `agree_list_eq` to turn
+--   -- | "n-close for all n" into list equality (and hence record equality via `ext`).
+--   | ofe_equiv_dist => \lam x y => (
+--       \lam eq n => (
+--         \lam a ain => (
+--           transport (\lam z => \Sigma (b : A.E) (In b z.agree_list) (A.dist n a b))
+--                     eq
+--                     (a, ain, A.ofe_dist_refl n a)
+--         ),
+--         \lam b bin => (
+--           transport (\lam z => \Sigma (a : A.E) (In a z.agree_list) (A.dist n a b))
+--                     (inv eq)
+--                     (b, bin, A.ofe_dist_refl n b)
+--         )
+--       ),
+--       \lam h => ext (agree_list_eq x y h)
+--     )
+--
+--   -- | Reflexivity: each element matches itself by `A`'s reflexivity.
+--   | ofe_dist_refl => \lam n x => (
+--       \lam a ain => (a, ain, A.ofe_dist_refl n a),
+--       \lam b bin => (b, bin, A.ofe_dist_refl n b)
+--     )
+--
+--   -- | Symmetry: swap the two directions of the matching and apply `A`'s symmetry.
+--   | ofe_dist_sym => \lam n x y h => (
+--       \lam b bin => \case h.2 b bin \with {
+--         | (a, ain, dab) => (a, ain, A.ofe_dist_sym n a b dab)
+--       },
+--       \lam a ain => \case h.1 a ain \with {
+--         | (b, bin, dab) => (b, bin, A.ofe_dist_sym n b a dab)
+--       }
+--     )
+--
+--   -- | Transitivity: chain a match through the middle agreement `y`, then use `A`'s
+--   -- | transitivity on the two found witnesses.
+--   | ofe_dist_trans => \lam n x y z hxy hyz => (
+--       \lam a ain => \case hxy.1 a ain \with {
+--         | (b, bin, dab) => \case hyz.1 b bin \with {
+--           | (c, cin, dbc) => (c, cin, A.ofe_dist_trans n a b c dab dbc)
+--         }
+--       },
+--       \lam c cin => \case hyz.2 c cin \with {
+--         | (b, bin, dbc) => \case hxy.2 b bin \with {
+--           | (a, ain, dab) => (a, ain, A.ofe_dist_trans n a b c dab dbc)
+--         }
+--       }
+--     )
+--
+--   -- | Monotonicity in the step-index: `n`-closeness implies `m`-closeness for `m <= n`,
+--   -- | pointwise via `A.ofe_dist_le`.
+--   | ofe_dist_le => \lam n m x y h le => (
+--       \lam a ain => \case h.1 a ain \with {
+--         | (b, bin, dab) => (b, bin, A.ofe_dist_le n m a b dab le)
+--       },
+--       \lam b bin => \case h.2 b bin \with {
+--         | (a, ain, dab) => (a, ain, A.ofe_dist_le n m a b dab le)
+--       }
+--     )
+--
+--
+--
+-- | The CMRA operation: merge two agreements by concatenating their candidate lists.
+-- | Non-emptiness is inherited from `x` via `in_app_left`.
+-- \func AgreeOp {A : OFE} (x y : AgreeElem A) : AgreeElem A \cowith
+--   | agree_list => x.agree_list ++ y.agree_list
+--   | agree_not_nil => \case x.agree_not_nil \with {
+--     | (a, ain) => (a, in_app_left ain)
+--   }
+--
+--
+--
+-- | Step-indexed validity: `x` is `n`-valid iff every pair of stored candidates is
+-- | `n`-equivalent, i.e. all candidates agree up to step `n`.
+-- \func AgreeValidN {A : OFE} (n : Nat) (x : AgreeElem A) : \Prop =>
+--   \Pi (a b : A.E) -> In a x.agree_list -> In b x.agree_list -> A.dist n a b
+--
+-- | Full validity: `n`-validity at every step index `n`.
+-- \func AgreeValid {A : OFE} (x : AgreeElem A) : \Prop =>
+--   \Pi (n : Nat) -> AgreeValidN {A} n x
+--
+--
+--
+-- | Persistent core: agreement is fully duplicable, so the core is the identity
+-- | (`pcore x = just x`). This is what makes `to_agree a` persistent in Iris.
+-- \func AgreePCore {A : OFE} (x : AgreeElem A) : Maybe (AgreeElem A) => just x
+--
+--
+-- | The agreement CMRA instance, bundling the OFE, op, validity and core above and
+-- | discharging all CMRA laws. Idempotent, commutative, associative, with identity core.
+-- \func AgreeCMRA (A : OFE) : CMRA \cowith
+--   | OFE => AgreeOFE A
+--   | pcore => AgreePCore
+--   | op => AgreeOp
+--   | valid => AgreeValid
+--   | validN => AgreeValidN
+--
+--   -- | Op is non-expansive in its right argument: split membership in `x ++ y1` over the
+--   -- | two halves (`in_app_left`/`in_app_right`); the `x` part matches itself, the `y`
+--   -- | part is transported through the hypothesis `hy : y1 =[n] y2`.
+--   | cmra_op_ne => \lam x n y1 y2 hy => (
+--       \lam a ain => \case ain \with {
+--         | in_app_left ax => \case hy.1 a ax \with {
+--           | (b, bin, dab) => (b, in_app_left bin, dab)
+--         }
+--         | in_app_right ay1 => \case hy.2 a ay1 \with {
+--           | (b, bin, dab) => (b, in_app_right bin, dab)
+--         }
+--       },
+--       \lam b bin => \case bin \with {
+--         | in_app_left bx => \case hy.1 b bx \with {
+--           | (a, ain, dba) => (a, in_app_left ain, dba)
+--         }
+--         | in_app_right by2 => \case hy.2 b by2 \with {
+--           | (a, ain, dba) => (a, in_app_right ain, dba)
+--         }
+--       }
+--     )
+--
+--   -- | Op is non-expansive in its left argument: symmetric to `cmra_op_ne`, splitting
+--   -- | membership over `x1 ++ y` and transporting the `x` half through `hx : x1 =[n] x2`.
+--   | cmra_op_ne_2 => \lam y n x1 x2 hx => (
+--       \lam a ain => \case ain \with {
+--         | in_app_left ax1 => \case hx.1 a ax1 \with {
+--           | (b, bin, dab) => (b, in_app_left bin, dab)
+--         }
+--         | in_app_right ay => \case hx.2 a ay \with {
+--           | (b, bin, dab) => (b, in_app_right bin, dab)
+--         }
+--       },
+--       \lam b bin => \case bin \with {
+--         | in_app_left bx2 => \case hx.1 b bx2 \with {
+--           | (a, ain, dba) => (a, in_app_left ain, dba)
+--         }
+--         | in_app_right by => \case hx.2 b by \with {
+--           | (a, ain, dba) => (a, in_app_right ain, dba)
+--         }
+--       }
+--     )
+--
+--   -- | Core is non-expansive: since `pcore = just id`, an `n`-equivalence `x =[n] y`
+--   -- | transports directly to the cores.
+--   | cmra_pcore_ne => \lam n x y cx hxy hpx => (y, idp, hxy)
+--
+--   -- | Validity is non-expansive: from `x =[n] y` and `n`-validity of `x`, derive
+--   -- | `n`-validity of `y` by routing each `a, b in y` through matching elements
+--   -- | `a', b' in x` and chaining `A`-distances (sym + two transitivities).
+--   | cmra_validN_ne => \lam n x y hxy hvx a b ain bin =>
+--       \case hxy.1 a ain \with {
+--         | (a', ain', daa') => \case hxy.2 b bin \with {
+--           | (b', bin', dbb') => A.ofe_dist_trans n a a' b
+--                                   daa'
+--                                   (A.ofe_dist_trans n a' b' b
+--                                     (hvx a' b' ain' bin')
+--                                     (A.ofe_dist_sym n b b' dbb'))
+--         }
+--       }
+--
+--   -- | Full validity is equivalent to validity at every step index (here both sides are
+--   -- | literally "for all n", so the equivalence is identity in each direction).
+--   | cmra_valid_validN => \lam x => (
+--       \lam hv n => hv n,
+--       \lam hvn n => hvn n
+--     )
+--
+--   -- | Downward closure of validity in the step-index: `n`-validity gives `m`-validity
+--   -- | for `m <= n`, pointwise via `A.ofe_dist_le`.
+--   | cmra_validN_le => \lam n m x hvn le a b ain bin =>
+--       A.ofe_dist_le n m a b (hvn a b ain bin) le
+--
+--   -- | Associativity of op: reduces to associativity of list concatenation
+--   -- | (`++-assoc`), lifted to records along a `path` and transporting the
+--   -- | non-emptiness witness across the same equality.
+--   | cmra_assoc => \lam x y z => path (\lam i => \new AgreeElem A {
+--       | agree_list => ++-assoc x.agree_list y.agree_list z.agree_list @ i
+--       | agree_not_nil => \case x.agree_not_nil \with {
+--         | (a, ain) => (a, transport (In a) (++-assoc x.agree_list y.agree_list z.agree_list) (in_app_left (in_app_left ain)))
+--       }
+--     })
+--
+--   -- | Commutativity of op: although `x ++ y` and `y ++ x` differ as lists, they are
+--   -- | OFE-equal because the candidate sets coincide; proved via `agree_comm_proof`.
+--   | cmra_comm => \lam x y => ext (agree_comm_proof x y)
+--
+--   -- | Core absorption `pcore x = just cx => cx . x = x`: since `cx = x` and op is
+--   -- | idempotent up to OFE-equality, the law follows once `hpx` is `idp`.
+--   | cmra_pcore_l => \lam x cx hpx => \case hpx \with {
+--     | idp => idp
+--   }
+--
+--   -- | Core idempotence: `pcore` is the identity, so `pcore (core x) = pcore x` holds
+--   -- | by the same proof `hpx`.
+--   | cmra_pcore_idemp => \lam x cx hpx => hpx
+--
+--   -- | Core monotonicity along extension order: since the core is the identity, an
+--   -- | inclusion `hincl` between elements lifts directly to their cores.
+--   | cmra_pcore_mono => \lam x y cx hincl hpx => (y, idp, hincl)
+--
+--   -- | Validity of a composite implies validity of the left factor: any two candidates
+--   -- | of `x` are also candidates of `x ++ y` (via `in_app_left`), so reuse `hv`.
+--   | cmra_validN_op_l => \lam n x y hv a b ain bin =>
+--       hv a b (in_app_left ain) (in_app_left bin)
+--
+--   -- | CMRA extend: given `x` n-valid and `x =[n] y1 . y2`, split `x` into two
+--   -- | factors. Here both factors are taken to be `x` itself, with the supplied
+--   -- | `n`-distances reused as the two extension witnesses.
+--   | cmra_extend => \lam n x y1 y2 hvx hdist => (x, x, idp, hdist.1, hdist.2)
+--
+--
+--
+-- | Auxiliary (stated, proof omitted): if two agreements are `n`-close for all `n`,
+-- | their candidate lists are equal. Used to prove `ofe_equiv_dist` for `AgreeOFE`.
+-- \func agree_list_eq {A : OFE} (x y : AgreeElem A)
+--   (h : \Pi (n : Nat) -> (AgreeOFE A).dist n x y)
+--   : x.agree_list = y.agree_list
+--
+--
+-- | Commutativity proof for op as an actual equality: `x ++ y = y ++ x` in `Ag(A)`,
+-- | obtained from the OFE characterization since each side's candidates appear in the
+-- | other (swapping `in_app_left`/`in_app_right`). Feeds `cmra_comm`.
+-- \func agree_comm_proof {A : OFE} (x y : AgreeElem A)
+--   : AgreeOp x y = AgreeOp y x =>
+--   (AgreeOFE A).ofe_equiv_dist (AgreeOp x y) (AgreeOp y x) .2 (\lam n => (
+--     \lam a ain => \case ain \with {
+--       | in_app_left ax => (a, in_app_right ax, A.ofe_dist_refl n a)
+--       | in_app_right ay => (a, in_app_left ay, A.ofe_dist_refl n a)
+--     },
+--     \lam b bin => \case bin \with {
+--       | in_app_left by => (b, in_app_right by, A.ofe_dist_refl n b)
+--       | in_app_right bx => (b, in_app_left bx, A.ofe_dist_refl n b)
+--     }
+--   ))
+--
+-- -- Agree is idempotent (via equivalence)
+-- | Idempotence up to `n`-distance: `x . x =[n] x`. Candidates of `x ++ x` come from
+-- | one of the two copies (both equal to a candidate of `x`), and each candidate of `x`
+-- | is found in the left copy. Justifies that the core may equal the element itself.
+-- \func agree_idemp {A : OFE} (x : AgreeElem A) (n : Nat)
+--   : (AgreeOFE A).dist n (AgreeOp x x) x =>
+--   (
+--     \lam a ain => \case ain \with {
+--       | in_app_left ax => (a, ax, A.ofe_dist_refl n a)
+--       | in_app_right ax => (a, ax, A.ofe_dist_refl n a)
+--     },
+--     \lam a ax => (a, in_app_left ax, A.ofe_dist_refl n a)
+--   )
+--
+--
+--
+-- | `to_agree` is non-expansive: `a1 =[n] a2` implies `to_agree a1 =[n] to_agree a2`.
+-- | Both singletons have a single candidate, so matching is forced to that element and
+-- | the distance is transported along the `here` equality (using symmetry one way).
+-- \func to_agree_ne {A : OFE} (n : Nat) (a1 a2 : A.E) (h : A.dist n a1 a2)
+--   : (AgreeOFE A).dist n (to_agree a1) (to_agree a2) =>
+--   (
+--     \lam a ain => \case ain \with {
+--       | here p => (a2, here idp, transport (\lam z => A.dist n z a2) p h)
+--       | there _ nin => \case nin \with {}
+--     },
+--     \lam b bin => \case bin \with {
+--       | here p => (a1, here idp, transport (\lam z => A.dist n a1 z) p (A.ofe_dist_sym n a2 a1 h))
+--       | there _ nin => \case nin \with {}
+--     }
+--   )
+--
+--
+--
+-- | Injectivity of agreement under validity: if `to_agree a . to_agree b` is `n`-valid,
+-- | then `a =[n] b`. Direct instance of validity applied to the two singleton members.
+-- | This is Iris's `agree_op_inv` / `to_agree` injectivity principle.
+-- \func to_agree_op_inv {A : OFE} (n : Nat) (a b : A.E)
+--   (hv : AgreeValidN {A} n (AgreeOp (to_agree a) (to_agree b)))
+--   : A.dist n a b =>
+--   hv a b (in_app_left (here idp)) (in_app_right (here idp))
+--
+--
+--
+-- | List helper: associativity of `++`, by induction on the first list.
+-- \func ++-assoc {A : \Set} (l1 l2 l3 : List A) : l1 ++ (l2 ++ l3) = (l1 ++ l2) ++ l3 \elim l1
+--   | nil => idp
+--   | :: a l1 => pmap (a ::) (++-assoc l1 l2 l3)
+--
+-- | List helper: `nil` is a right unit for `++`, by induction on the list.
+-- \func ++-nil {A : \Set} (l : List A) : l ++ nil = l \elim l
+--   | nil => idp
+--   | :: a l => pmap (a ::) (++-nil l)
+--
+-- | List helper: membership is preserved by appending on the right (`In a l1 -> In a (l1 ++ l2)`).
+-- \func in_app_left {A : \Set} {a : A} {l1 l2 : List A} (h : In a l1) : In a (l1 ++ l2) \elim l1, h
+--   | :: a' l1, here p => here p
+--   | :: a' l1, there _ h => there a' (in_app_left h)
+--
+-- | List helper: membership is preserved by prepending on the left (`In a l2 -> In a (l1 ++ l2)`).
+-- \func in_app_right {A : \Set} {a : A} {l1 l2 : List A} (h : In a l2) : In a (l1 ++ l2) \elim l1
+--   | nil => h
+--   | :: a' l1 => there a' (in_app_right h)
+--
+--

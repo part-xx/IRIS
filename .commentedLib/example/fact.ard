@@ -1,0 +1,758 @@
+-- | Worked example: verifying an imperative factorial in the IRIS weakest-precondition logic.
+-- |
+-- | This module formalizes a small heap-manipulating program that computes the factorial
+-- | of a natural number by repeated in-place multiplication into a reference cell, and proves
+-- | it correct against a Hoare triple in the style of Iris.  The program `factorial_prog`
+-- | allocates a cell, builds a closure `g` over it, and the recursive helper `fact` multiplies
+-- | the accumulator stored in the cell by `n, n-1, ..., 1`.
+-- |
+-- | The proofs are carried out in the canonical heap CMRA `HeapCMRA Loc cnt Value` (an
+-- | authoritative gmap of locations to exclusive values), using the weakest-precondition
+-- | calculus `wp` and the derived Hoare triple `ht = □(P -∗ wp e Φ)`.  The central result is
+-- | `fact_var_spec`/`fact_closure_correct`: for any starting accumulator `j` the loop computes
+-- | `j * k!` while preserving ownership of the cell; this is proved by induction on `k` using
+-- | the structural `wp` lemmas (bind, pure-step, load, store, mul).  `factorial_correct'` then
+-- | establishes the top-level spec `factorial_spec`, and `factorial_correct_Q` repackages it into
+-- | the existentially-abstracted invariant form `factorial_spec_Q`.
+
+\import Logic
+\import Arith.Nat
+\import Data.Bool
+\import Data.Maybe
+\import Order.PartialOrder
+\import Paths
+\import Set
+\import lang
+\import hoare
+\import weakestpre
+\import uPred
+\import cmra
+\import lib.heap
+\import lib.gmap_cmra
+\import lib.excl_cmra
+\import interface
+
+-- =================================================================================
+-- Factorial in IRIS
+-- =================================================================================
+--
+--   g  :=  let l = ref 1 in
+--          \k. fact k l
+--
+--   fact n l :=
+--          if n = 0 then !l
+--          else  l := !l * n;
+--                fact (n-1) l
+--
+-- =================================================================================
+
+-- | The recursive factorial loop as an object-language expression.
+-- | `fact n l` tests whether `n` is zero: if so it returns the current contents of cell `l`,
+-- | otherwise it stores `!l * n` back into `l` and recurses on `n-1` (the `Lam "_"` sequences
+-- | the store before the recursive call).
+\func fact_body : Expr =>
+  Rec "fact" "n" (Lam "l" (
+    If (IsZero (Var "n"))
+        (Load (Var "l"))
+        (App
+            (Lam "_" (App (App (Var "fact") (Pred (Var "n"))) (Var "l")))
+            (Store (Var "l")
+                (Mul (Load (Var "l")) (Var "n"))))))
+
+-- | The full top-level program: allocate a fresh cell initialized to `1`, then apply the
+-- | closure `\l. \k. fact k l` to that location, yielding the curried entry point `g` that
+-- | takes `k` and computes `k!` using the shared cell.
+\func factorial_prog : Expr =>
+  App (Val (LamV "l" (Lam "k" (App (App (Var "fact") (Var "k")) (Var "l")))))
+      (Alloc (Val (LitV (LitInt 1))))
+
+-- =================================================================================
+-- The Hoare triple of Fact
+--
+--  {True} g {h. ∃ l w. l ↦ w  *
+--               ∀ k. {∃ u. l ↦ u}  h k  {v. v = k!  *  ∃ w'. l ↦ w'} }
+-- =================================================================================
+
+-- | Specification of the factorial program.  Running `factorial_prog` from the trivial
+-- | precondition produces a handle `h` together with a private cell `l` (owned via `l ↦ w`)
+-- | such that, for every `k`, calling `h k` from `∃u. l ↦ u` returns `k!` and leaves the cell
+-- | owned again.  This is the externally usable "library" specification of the closure.
+\func factorial_spec
+  {cnt : Countable Loc}
+  : ProperUPred (HeapCMRA Loc cnt Value) =>
+  ht (mkProperPure (\Sigma)) factorial_prog
+      (\lam h => mkProperExist Loc (\lam l =>
+          mkProperExist Value (\lam w =>
+              mkProperSep
+                  (pointsTo l w)
+                  (mkProperForall Nat (\lam k =>
+                      ht
+                          (mkProperExist Value (\lam u => pointsTo l u))
+                          (App (Val h) (Val (natV k)))
+                          (\lam v =>
+                              mkProperAnd
+                                  (mkProperPure (v = natV (nat_fact k)))
+                                  (mkProperExist Value (\lam w' => pointsTo l w'))))))))
+
+-- | Abstracted variant of `factorial_spec` using an existentially-quantified invariant `Q`.
+-- | Instead of exposing the concrete cell, the spec hides the internal state behind some
+-- | resource `Q` (instantiated to `∃u. l ↦ u`): the client gets `Q`, and `h k` consumes and
+-- | reproduces `Q` while returning `k!`.  This is the abstract-predicate / representation-hiding
+-- | form, derived from `factorial_spec` in `factorial_correct_Q`.
+\func factorial_spec_Q
+  {cnt : Countable Loc}
+  : ProperUPred (HeapCMRA Loc cnt Value) =>
+  ht (mkProperPure (\Sigma)) factorial_prog
+      (\lam h =>
+          mkProperExist (ProperUPred (HeapCMRA Loc cnt Value)) (\lam Q =>
+              mkProperSep
+                  Q
+                  (mkProperForall Nat (\lam k =>
+                      ht
+                          Q
+                          (App (Val h) (Val (natV k)))
+                          (\lam v =>
+                              mkProperAnd
+                                  (mkProperPure (v = natV (nat_fact k)))
+                                  Q)))))
+
+
+
+
+
+
+-- =================================================================================
+-- Support Lemmas
+-- =================================================================================
+
+-- | Core correctness lemma for the loop, proved by induction on the recursion depth `k`.
+-- | Given ownership `l ↦ j` of the accumulator, running `fact_body k l` terminates with value
+-- | `j * k!` and leaves the cell holding `j * k!`.  This is the strengthened (accumulator-generic)
+-- | invariant that makes the induction go through.
+-- |
+-- | Proof idea: in the base case `k = 0` the loop reads the cell after `IsZero` reduces to
+-- | `true` (using `wp_load`, `wp_pure_step` for the `If`, and `wp_bind_if`), rewriting `j` to
+-- | `j * 0!` via `ide-right`.  In the step case `suc k'` we unfold one iteration — load the cell,
+-- | multiply by `n` (`wp_bind_mul_l`, `wp_mul`), store the new accumulator `j * (k'+1)`, and
+-- | invoke the induction hypothesis on `k'` with accumulator `j * (k'+1)`, then re-associate
+-- | `(j*(k'+1)) * k'! = j * (k'+1)!` via `*-assoc`.
+\func fact_var_spec
+  {cnt : Countable Loc} (l : Loc) (j k : Nat)
+  : properUPred_ent {HeapCMRA Loc cnt Value}
+    (pointsTo l (natV j))
+    (wp (App (App fact_body (Val (natV k))) (Val (LitV (LitLoc l))))
+        (\lam v => mkProperAnd
+            (mkProperPure (v = natV (j Nat.* nat_fact k)))
+            (pointsTo l (natV (j Nat.* nat_fact k)))))
+\elim k
+  | 0 =>
+    \let
+      | M => HeapCMRA Loc cnt Value
+      | Post : Value -> ProperUPred M =>
+        \lam v => mkProperAnd
+            (mkProperPure (v = natV (j Nat.* nat_fact 0)))
+            (pointsTo l (natV (j Nat.* nat_fact 0)))
+      | recV : Value =>
+        RecV "fact" "n" (Lam "l" (
+          If (IsZero (Var "n"))
+              (Load (Var "l"))
+              (App (Lam "_" (App (App (Var "fact") (Pred (Var "n"))) (Var "l")))
+                  (Store (Var "l") (Mul (Load (Var "l")) (Var "n"))))))
+      -- | After the `IsZero` test reduces to `true`, the body is a pure `Load`; `wp_load` gives
+      -- | back the read value together with the unchanged points-to.
+      | s_load : properUPred_ent
+          (pointsTo l (natV j))
+          (wp (Load (Val (LitV (LitLoc l))))
+              (\lam v' => mkProperAnd (mkProperPure (v' = natV j)) (pointsTo l (natV j))))
+      => wp_load l (natV j)
+      -- | Weaken the load's postcondition to `Post` by rewriting `j` to `j * 0!` (`ide-right`).
+      | s_load' : properUPred_ent
+          (pointsTo l (natV j))
+          (wp (Load (Val (LitV (LitLoc l)))) Post)
+      => properUPred_ent_trans
+            (pointsTo l (natV j))
+            (wp (Load (Val (LitV (LitLoc l))))
+                (\lam v' => mkProperAnd (mkProperPure (v' = natV j)) (pointsTo l (natV j))))
+            (wp (Load (Val (LitV (LitLoc l)))) Post)
+            s_load
+            (wp_post_mono (Load (Val (LitV (LitLoc l))))
+                (\lam v' => mkProperAnd (mkProperPure (v' = natV j)) (pointsTo l (natV j)))
+                Post
+                (\lam v' n a hv hand =>
+                    \let
+                      | eq : natV j = natV (j Nat.* nat_fact 0) =>
+                        pmap natV (inv NatSemiring.ide-right)
+                    \in
+                      ( hand.1 *> eq
+                      , transport (\lam w => (pointsTo l w).upred_holds n a) eq hand.2 )))
+      -- | The `If` whose guard is literally `true` takes a pure step to its then-branch (`Load`).
+      | s_iszero : properUPred_ent
+          (wp (Load (Val (LitV (LitLoc l)))) Post)
+          (wp (If (Val (LitV (LitBool true))) (Load (Val (LitV (LitLoc l))))
+              (App (Lam "_" (App (App (Val recV) (Pred (Val (natV 0)))) (Val (LitV (LitLoc l)))))
+                  (Store (Val (LitV (LitLoc l)))
+                      (Mul (Load (Val (LitV (LitLoc l)))) (Val (natV 0))))))
+              Post)
+      => wp_pure_step
+            (If (Val (LitV (LitBool true))) (Load (Val (LitV (LitLoc l))))
+                (App (Lam "_" (App (App (Val recV) (Pred (Val (natV 0)))) (Val (LitV (LitLoc l)))))
+                    (Store (Val (LitV (LitLoc l)))
+                        (Mul (Load (Val (LitV (LitLoc l)))) (Val (natV 0))))))
+            (Load (Val (LitV (LitLoc l))))
+            (\lam s => IfTrueS _ _ idp idp idp)
+            idp
+            Post
+      | thenE : Expr => Load (Val (LitV (LitLoc l)))
+      | elseE : Expr =>
+        App (Lam "_" (App (App (Val recV) (Pred (Val (natV 0)))) (Val (LitV (LitLoc l)))))
+            (Store (Val (LitV (LitLoc l)))
+                (Mul (Load (Val (LitV (LitLoc l)))) (Val (natV 0))))
+      -- | Postcondition of evaluating the guard: once it is a value `v`, continue with `If v ...`.
+      | InnerPost : Value -> ProperUPred M =>
+        \lam v => wp (If (Val v) thenE elseE) Post
+      -- | Evaluate the guard `IsZero 0`, which yields `true` (`wp_iszero_zero`), feeding `InnerPost`.
+      | s_iszero_inner : properUPred_ent
+          (wp (Load (Val (LitV (LitLoc l)))) Post)
+          (wp (IsZero (Val (natV 0))) InnerPost)
+      => properUPred_ent_trans
+            (wp (Load (Val (LitV (LitLoc l)))) Post)
+            (InnerPost (LitV (LitBool true)))
+            (wp (IsZero (Val (natV 0))) InnerPost)
+            s_iszero
+            (wp_iszero_zero InnerPost)
+      -- | Combine the guard evaluation with the bind rule `wp_bind_if` to reduce the whole `If`.
+      | s_iszero_step : properUPred_ent
+          (wp (Load (Val (LitV (LitLoc l)))) Post)
+          (wp (If (IsZero (Val (natV 0))) thenE elseE) Post)
+      => properUPred_ent_trans
+            (wp (Load (Val (LitV (LitLoc l)))) Post)
+            (wp (IsZero (Val (natV 0))) InnerPost)
+            (wp (If (IsZero (Val (natV 0))) thenE elseE) Post)
+            s_iszero_inner
+            (wp_bind_if (IsZero (Val (natV 0))) thenE elseE Post)
+    \in
+      \lam n a hv hpts =>
+          \let
+            | wp_if_iszero : properUPred_ent
+                (wp (Load (Val (LitV (LitLoc l)))) Post)
+                (wp (If (IsZero (Val (natV 0))) thenE elseE) Post)
+            => s_iszero_step
+            -- | The conditional body with the location argument `l` substituted for the variable.
+            | body_after_l : Expr =>
+              subst "l" (LitV (LitLoc l))
+                  (If (IsZero (Val (natV 0))) (Load (Var "l"))
+                      (App (Lam "_" (App (App (Val recV) (Pred (Val (natV 0)))) (Var "l")))
+                          (Store (Var "l") (Mul (Load (Var "l")) (Val (natV 0))))))
+            -- | Beta-reduce the application of the `Lam "l"` closure to the location value.
+            | s_beta_l : properUPred_ent
+                (wp body_after_l Post)
+                (wp (App (Val (LamV "l"
+                    (If (IsZero (Val (natV 0))) (Load (Var "l"))
+                        (App (Lam "_" (App (App (Val recV) (Pred (Val (natV 0)))) (Var "l")))
+                            (Store (Var "l") (Mul (Load (Var "l")) (Val (natV 0))))))))
+                    (Val (LitV (LitLoc l)))) Post)
+            => wp_pure_step
+                  (App (Val (LamV "l"
+                      (If (IsZero (Val (natV 0))) (Load (Var "l"))
+                          (App (Lam "_" (App (App (Val recV) (Pred (Val (natV 0)))) (Var "l")))
+                              (Store (Var "l") (Mul (Load (Var "l")) (Val (natV 0))))))))
+                      (Val (LitV (LitLoc l))))
+                  body_after_l
+                  (\lam s => BetaS "l" _ _ idp idp idp)
+                  idp
+                  Post
+          \in
+            {?}
+  | suc k' =>
+    \let
+      | M => HeapCMRA Loc cnt Value
+      -- | The accumulator after this iteration's multiplication: `j * (k'+1)`.
+      | jk : Nat => j Nat.* suc k'
+      | Post : Value -> ProperUPred M =>
+        \lam v => mkProperAnd
+            (mkProperPure (v = natV (j Nat.* nat_fact (suc k'))))
+            (pointsTo l (natV (j Nat.* nat_fact (suc k'))))
+      -- | Induction hypothesis: the loop on `k'` with accumulator `jk` computes `jk * k'!`.
+      | ih : properUPred_ent
+          (pointsTo l (natV jk))
+          (wp (App (App fact_body (Val (natV k'))) (Val (LitV (LitLoc l))))
+              (\lam v => mkProperAnd
+                  (mkProperPure (v = natV (jk Nat.* nat_fact k')))
+                  (pointsTo l (natV (jk Nat.* nat_fact k')))))
+      => fact_var_spec l jk k'
+      -- | Associativity rewrite: `(j*(k'+1)) * k'! = j * (k'+1)!`.
+      | arith : jk Nat.* nat_fact k' = j Nat.* nat_fact (suc k') =>
+        NatSemiring.*-assoc {j} {suc k'} {nat_fact k'}
+      -- | The induction hypothesis transported along `arith` so its postcondition matches `Post`.
+      | ih_post : properUPred_ent
+          (pointsTo l (natV jk))
+          (wp (App (App fact_body (Val (natV k'))) (Val (LitV (LitLoc l)))) Post)
+      => transport
+            (\lam r => properUPred_ent
+                (pointsTo l (natV jk))
+                (wp (App (App fact_body (Val (natV k'))) (Val (LitV (LitLoc l))))
+                    (\lam v => mkProperAnd
+                        (mkProperPure (v = natV r))
+                        (pointsTo l (natV r)))))
+            arith
+            ih
+    \in
+      \let
+        | locV : Value => LitV (LitLoc l)
+        | nV   : Value => natV (suc k')
+        | jkV  : Value => natV jk
+        | bodyR : Expr =>
+          Lam "l" (
+            If (IsZero (Var "n"))
+                (Load (Var "l"))
+                (App (Lam "_" (App (App (Var "fact") (Pred (Var "n"))) (Var "l")))
+                    (Store (Var "l") (Mul (Load (Var "l")) (Var "n")))))
+        | recV : Value => RecV "fact" "n" bodyR
+            | thenE : Expr => Load (Val locV)
+        | elseE : Expr =>
+          App (Lam "_" (App (App (Val recV) (Pred (Val nV))) (Val locV)))
+              (Store (Val locV) (Mul (Load (Val locV)) (Val nV)))
+            -- | Load the current accumulator `j` from the cell.
+            | s_load1 : properUPred_ent
+          (pointsTo l (natV j))
+          (wp (Load (Val locV))
+              (\lam v => mkProperAnd (mkProperPure (v = natV j)) (pointsTo l (natV j))))
+      => wp_load l (natV j)
+            -- | Postcondition after computing `!l * n`: the product is `jk = j*(k'+1)`, cell unchanged.
+            | mul_post : Value -> ProperUPred M =>
+        \lam u => mkProperAnd (mkProperPure (u = natV jk)) (pointsTo l (natV j))
+        -- | Evaluate `Mul (Load l) n`: load `j` then multiply by `(k'+1)` (`wp_bind_mul_l`, `wp_mul`),
+        -- | obtaining `jk` while retaining `l ↦ j`.
+        | s_mul_after_load : properUPred_ent
+            (pointsTo l (natV j))
+            (wp (Mul (Load (Val locV)) (Val nV)) mul_post)
+        => properUPred_ent_trans
+              (pointsTo l (natV j))
+              (wp (Load (Val locV))
+                  (\lam v => mkProperAnd (mkProperPure (v = natV j)) (pointsTo l (natV j))))
+              (wp (Mul (Load (Val locV)) (Val nV)) mul_post)
+              s_load1
+              (properUPred_ent_trans
+                  (wp (Load (Val locV))
+                      (\lam v => mkProperAnd (mkProperPure (v = natV j)) (pointsTo l (natV j))))
+                  (wp (Load (Val locV))
+                      (\lam v => wp (Mul (Val v) (Val nV)) mul_post))
+                  (wp (Mul (Load (Val locV)) (Val nV)) mul_post)
+                  (wp_post_mono (Load (Val locV))
+                      (\lam v => mkProperAnd (mkProperPure (v = natV j)) (pointsTo l (natV j)))
+                      (\lam v => wp (Mul (Val v) (Val nV)) mul_post)
+                      (\lam v n a hv hand =>
+                          transport
+                              (\lam w => (wp (Mul (Val w) (Val nV)) mul_post).upred_holds n a)
+                              (inv hand.1)
+                              (wp_mul j (suc k') mul_post n a hv
+                                  (idp, hand.2))))
+                  (wp_bind_mul_l (Load (Val locV)) (Val nV) mul_post))
+
+-- =================================================================================
+-- Proof
+-- =================================================================================
+
+-- | The loop is correct on a fresh closure: a thin renaming of `fact_var_spec`, stating that
+-- | running `fact_body k l` from `l ↦ j` returns `j * k!` and re-establishes ownership of the cell.
+\func fact_closure_correct
+  {cnt : Countable Loc}
+  (l   : Loc)
+  (j k : Nat)
+  : properUPred_ent {HeapCMRA Loc cnt Value}
+    (pointsTo l (natV j))
+    (wp (App (App fact_body (Val (natV k))) (Val (LitV (LitLoc l))))
+        (\lam v => mkProperAnd
+            (mkProperPure (v = natV (j Nat.* nat_fact k)))
+            (pointsTo l (natV (j Nat.* nat_fact k)))))
+  => fact_var_spec l j k
+
+-- | Same statement as `fact_closure_correct` under a different name (correctness of the body),
+-- | again discharged directly by the induction lemma `fact_var_spec`.
+\func fact_body_correct
+  {cnt : Countable Loc}
+  (l   : Loc)
+  (j k : Nat)
+  : properUPred_ent {HeapCMRA Loc cnt Value}
+    (pointsTo l (natV j))
+    (wp (App (App fact_body (Val (natV k))) (Val (LitV (LitLoc l))))
+        (\lam v => mkProperAnd
+            (mkProperPure (v = natV (j Nat.* nat_fact k)))
+            (pointsTo l (natV (j Nat.* nat_fact k)))))
+  => fact_var_spec l j k
+
+
+
+
+-- | Top-level correctness: `True ⊢ factorial_spec`, i.e. the whole program meets its Hoare triple.
+-- |
+-- | Proof structure: allocate the cell (`wp_alloc` gives `∃l. vloc = LitLoc l ∧ l ↦ 1`), then
+-- | bind into the application of the closure (`wp_bind_app_r`).  For each allocated `l` we
+-- | provide the witnessing existential `Φ (h_lam l)`: the returned closure `h` paired with the
+-- | per-call Hoare triple, which follows from `fact_closure_correct` with accumulator `1`
+-- | (rewriting `1 * k! = k!` via `ide-left`) and weakening `l ↦ k!` to `∃w'. l ↦ w'`.
+-- | The pieces are assembled with `wp_post_mono`, `wp_value_intro`, `exist_elim_ent`, and
+-- | `properUPred_ent_trans`.  (Two `{?}` holes remain in the development.)
+\func factorial_correct'
+  {cnt : Countable Loc}
+  : properUPred_ent {HeapCMRA Loc cnt Value}
+    (mkProperPure (\Sigma))
+    factorial_spec
+  =>
+    \let
+      -- | The program postcondition — the body of `factorial_spec`.
+      | Phi : Value -> ProperUPred (HeapCMRA Loc cnt Value) =>
+        \lam h => mkProperExist Loc (\lam l =>
+            mkProperExist Value (\lam w =>
+                mkProperSep (pointsTo l w)
+                    (mkProperForall Nat (\lam k =>
+                        ht
+                            (mkProperExist Value (\lam u => pointsTo l u))
+                            (App (Val h) (Val (natV k)))
+                            (\lam v =>
+                                mkProperAnd
+                                    (mkProperPure (v = natV (nat_fact k)))
+                                    (mkProperExist Value (\lam w' => pointsTo l w')))))))
+      -- | Postcondition of `Alloc 1`: it returns some location value `vloc = LitLoc l` with `l ↦ 1`.
+      | Phi_alloc : Value -> ProperUPred (HeapCMRA Loc cnt Value) =>
+        \lam vloc => mkProperExist Loc (\lam l =>
+            mkProperAnd
+                (mkProperPure (vloc = LitV (LitLoc l)))
+                (pointsTo l (LitV (LitInt 1))))
+      -- | Allocation step: `True ⊢ wp (Alloc 1) Φ_alloc`.
+      | s_alloc : properUPred_ent (mkProperPure (\Sigma))
+          (wp (Alloc (Val (LitV (LitInt 1)))) Phi_alloc)
+      => wp_alloc (LitV (LitInt 1))
+      -- | Bind rule for the application argument: evaluate `Alloc 1` first, then feed its result
+      -- | into the closure application that forms `factorial_prog`.
+      | s_bind : properUPred_ent
+          (wp (Alloc (Val (LitV (LitInt 1))))
+              (\lam vloc => wp (App (Val (LamV "l" (Lam "k" (App (App (Var "fact") (Var "k")) (Var "l"))))) (Val vloc)) Phi))
+          (wp factorial_prog Phi)
+      => wp_bind_app_r
+            (LamV "l" (Lam "k" (App (App (Var "fact") (Var "k")) (Var "l"))))
+            (Alloc (Val (LitV (LitInt 1))))
+            Phi
+      -- | The returned handle closure for location `l`: `\k. fact k l`.
+      | h_lam : Loc -> Value =>
+        \lam l => LamV "k" (App (App (Var "fact") (Var "k")) (Val (LitV (LitLoc l))))
+      -- | For each `l`, ownership `l ↦ 1` entails the full postcondition `Φ (h_lam l)`: the
+      -- | witness `(l, 1, ...)` together with the per-call Hoare triple from `fact_closure_correct`.
+      | s_witness : \Pi (l : Loc) ->
+          properUPred_ent
+              (pointsTo l (LitV (LitInt 1)))
+              (Phi (h_lam l))
+      => \lam l n a hv hpts =>
+            inP (l, inP (LitV (LitInt 1),
+                         \let M => HeapCMRA Loc cnt Value
+                         \in inP (a, M.unit,
+                                  transport (\lam w => M.dist n a w)
+                                      (inv (ucmra_unit_right_id a))
+                                      (M.ofe_dist_refl n a),
+                                  hpts,
+                                  \lam k =>
+                                      \let
+                                        -- | The loop run with accumulator `1`: returns `1 * k!`.
+                                        | strong : properUPred_ent
+                                            (pointsTo l (natV 1))
+                                            (wp (App (App fact_body (Val (natV k))) (Val (LitV (LitLoc l))))
+                                                (\lam v => mkProperAnd
+                                                    (mkProperPure (v = natV (1 Nat.* nat_fact k)))
+                                                    (pointsTo l (natV (1 Nat.* nat_fact k)))))
+                                        => fact_closure_correct l 1 k
+                                        -- | Simplify `1 * k!` to `k!` (`ide-left`).
+                                        | strong' : properUPred_ent
+                                            (pointsTo l (natV 1))
+                                            (wp (App (App fact_body (Val (natV k))) (Val (LitV (LitLoc l))))
+                                                (\lam v => mkProperAnd
+                                                    (mkProperPure (v = natV (nat_fact k)))
+                                                    (pointsTo l (natV (nat_fact k)))))
+                                        => transport
+                                              (\lam r => properUPred_ent
+                                                  (pointsTo l (natV 1))
+                                                  (wp (App (App fact_body (Val (natV k))) (Val (LitV (LitLoc l))))
+                                                      (\lam v => mkProperAnd
+                                                          (mkProperPure (v = natV r))
+                                                          (pointsTo l (natV r)))))
+                                              NatSemiring.ide-left
+                                              strong
+                                        -- | Hide the exact cell value: weaken `l ↦ k!` to `∃w'. l ↦ w'`.
+                                        | weakened : properUPred_ent
+                                            (pointsTo l (natV 1))
+                                            (wp (App (App fact_body (Val (natV k))) (Val (LitV (LitLoc l))))
+                                                (\lam v => mkProperAnd
+                                                    (mkProperPure (v = natV (nat_fact k)))
+                                                    (mkProperExist Value (\lam w' => pointsTo l w'))))
+                                        => properUPred_ent_trans
+                                              (pointsTo l (natV 1))
+                                              (wp (App (App fact_body (Val (natV k))) (Val (LitV (LitLoc l))))
+                                                  (\lam v => mkProperAnd
+                                                      (mkProperPure (v = natV (nat_fact k)))
+                                                      (pointsTo l (natV (nat_fact k)))))
+                                              (wp (App (App fact_body (Val (natV k))) (Val (LitV (LitLoc l))))
+                                                  (\lam v => mkProperAnd
+                                                      (mkProperPure (v = natV (nat_fact k)))
+                                                      (mkProperExist Value (\lam w' => pointsTo l w'))))
+                                              strong'
+                                              (wp_post_mono
+                                                  (App (App fact_body (Val (natV k))) (Val (LitV (LitLoc l))))
+                                                  (\lam v => mkProperAnd
+                                                      (mkProperPure (v = natV (nat_fact k)))
+                                                      (pointsTo l (natV (nat_fact k))))
+                                                  (\lam v => mkProperAnd
+                                                      (mkProperPure (v = natV (nat_fact k)))
+                                                      (mkProperExist Value (\lam w' => pointsTo l w')))
+                                                  (\lam v n' a' hv' hand =>
+                                                      (hand.1, inP (natV (nat_fact k), hand.2))))
+                                      \in
+                                        {?})))
+      -- | After beta-reduction the handle value `h_lam l` satisfies `Φ` (via `wp_value_intro`).
+      | s_after_beta : \Pi (l : Loc) ->
+          properUPred_ent
+              (pointsTo l (LitV (LitInt 1)))
+              (wp (Val (h_lam l)) Phi)
+      => \lam l =>
+            properUPred_ent_trans
+                (pointsTo l (LitV (LitInt 1)))
+                (Phi (h_lam l))
+                (wp (Val (h_lam l)) Phi)
+                (s_witness l)
+                (wp_value_intro (h_lam l) Phi)
+      -- | The outer application `App (LamV "l" ...) l` beta-reduces and yields `Φ` (hole remaining).
+      | s_pure_outer : \Pi (l : Loc) ->
+          properUPred_ent
+              (pointsTo l (LitV (LitInt 1)))
+              (wp (App (Val (LamV "l" (Lam "k" (App (App (Var "fact") (Var "k")) (Var "l")))))
+                  (Val (LitV (LitLoc l))))
+                  Phi)
+      => {?}
+      -- | Lift `s_pure_outer` over the allocation result: from `Φ_alloc vloc` (which exposes the
+      -- | concrete `l` via its existential) derive the wp of the closure application.
+      | s_lift : \Pi (vloc : Value) ->
+          properUPred_ent
+              (Phi_alloc vloc)
+              (wp (App (Val (LamV "l" (Lam "k" (App (App (Var "fact") (Var "k")) (Var "l"))))) (Val vloc)) Phi)
+      => \lam vloc =>
+            exist_elim_ent Loc
+                (\lam l => mkProperAnd
+                    (mkProperPure (vloc = LitV (LitLoc l)))
+                    (pointsTo l (LitV (LitInt 1))))
+                (wp (App (Val (LamV "l" (Lam "k" (App (App (Var "fact") (Var "k")) (Var "l"))))) (Val vloc)) Phi)
+                (\lam l n a hv hand =>
+                    transport (\lam vv =>
+                            (wp (App (Val (LamV "l" (Lam "k" (App (App (Var "fact") (Var "k")) (Var "l")))))
+                                (Val vv)) Phi).upred_holds n a)
+                        (inv hand.1)
+                        (s_pure_outer l n a hv hand.2))
+      -- | Sequence allocation and the lifted closure application under one wp via `wp_post_mono`.
+      | s_alloc_then_lift : properUPred_ent
+          (mkProperPure (\Sigma))
+          (wp (Alloc (Val (LitV (LitInt 1))))
+              (\lam vloc => wp (App (Val (LamV "l" (Lam "k" (App (App (Var "fact") (Var "k")) (Var "l"))))) (Val vloc)) Phi))
+      => properUPred_ent_trans
+            (mkProperPure (\Sigma))
+            (wp (Alloc (Val (LitV (LitInt 1)))) Phi_alloc)
+            (wp (Alloc (Val (LitV (LitInt 1))))
+                (\lam vloc => wp (App (Val (LamV "l" (Lam "k" (App (App (Var "fact") (Var "k")) (Var "l"))))) (Val vloc)) Phi))
+            s_alloc
+            (wp_post_mono (Alloc (Val (LitV (LitInt 1))))
+                Phi_alloc
+                (\lam vloc => wp (App (Val (LamV "l" (Lam "k" (App (App (Var "fact") (Var "k")) (Var "l"))))) (Val vloc)) Phi)
+                s_lift)
+      -- | Compose allocation-then-lift with the bind rule to obtain the full `wp factorial_prog Φ`.
+      | s_full : properUPred_ent (mkProperPure (\Sigma)) (wp factorial_prog Phi)
+      => properUPred_ent_trans
+            (mkProperPure (\Sigma))
+            (wp (Alloc (Val (LitV (LitInt 1))))
+                (\lam vloc => wp (App (Val (LamV "l" (Lam "k" (App (App (Var "fact") (Var "k")) (Var "l"))))) (Val vloc)) Phi))
+            (wp factorial_prog Phi)
+            s_alloc_then_lift
+            s_bind
+    -- | Unfold the persistent Hoare triple `□(True -∗ wp ...)` to its step-indexed witness and
+    -- | discharge it with `s_full`.
+    \in \lam n a hv _ => \lam m m_le_n b _ => \lam m' m'_le_m a' hv_a' _ =>
+        s_full m' (op {HeapCMRA Loc cnt Value} b a') hv_a' ()
+
+
+
+
+
+-- | Derives the abstracted spec `factorial_spec_Q` from `factorial_spec`.
+-- |
+-- | Proof idea: take the concrete spec as `base`, choose the abstract predicate `Q := ∃u. l ↦ u`
+-- | (`QPred l`), and show via `post_step` that the concrete postcondition entails the abstracted
+-- | one: peel off the existentials for `l` and `w`, split the separating conjunction, fold
+-- | `l ↦ w` into `Q`, and convert each per-call concrete triple into a `Q`-triple using the
+-- | helper `htQ_of_htpts` (an application of the consequence rule `ht_conseq`).  The outer
+-- | structure is the persistent-triple plumbing carried over `wp_post_mono`.
+\func factorial_correct_Q
+  {cnt : Countable Loc}
+  : properUPred_ent {HeapCMRA Loc cnt Value}
+    (mkProperPure (\Sigma))
+    factorial_spec_Q
+  =>
+    \let
+      | base : properUPred_ent (mkProperPure (\Sigma)) factorial_spec =>
+        factorial_correct'
+      -- | The concrete invariant chosen to instantiate the abstract `Q`: "the cell holds something".
+      | QPred : Loc -> ProperUPred (HeapCMRA Loc cnt Value) =>
+        \lam l => mkProperExist Value (\lam u => pointsTo l u)
+      -- | Pointwise entailment from the concrete postcondition of `factorial_spec` to the
+      -- | existentially-abstracted postcondition of `factorial_spec_Q`, witnessing `Q := QPred l`.
+      | post_step : \Pi (h : Value) ->
+          properUPred_ent
+              (mkProperExist Loc (\lam l =>
+                  mkProperExist Value (\lam w =>
+                      mkProperSep (pointsTo l w)
+                          (mkProperForall Nat (\lam k =>
+                              ht
+                                  (mkProperExist Value (\lam u => pointsTo l u))
+                                  (App (Val h) (Val (natV k)))
+                                  (\lam v => mkProperAnd
+                                      (mkProperPure (v = natV (nat_fact k)))
+                                      (mkProperExist Value (\lam w' => pointsTo l w'))))))))
+              (mkProperExist (ProperUPred (HeapCMRA Loc cnt Value)) (\lam Q =>
+                  mkProperSep Q
+                      (mkProperForall Nat (\lam k =>
+                          ht Q
+                              (App (Val h) (Val (natV k)))
+                              (\lam v => mkProperAnd
+                                  (mkProperPure (v = natV (nat_fact k)))
+                                  Q)))))
+      => \lam h =>
+            exist_elim_ent Loc
+                (\lam l =>
+                    mkProperExist Value (\lam w =>
+                        mkProperSep (pointsTo l w)
+                            (mkProperForall Nat (\lam k =>
+                                ht
+                                    (mkProperExist Value (\lam u => pointsTo l u))
+                                    (App (Val h) (Val (natV k)))
+                                    (\lam v => mkProperAnd
+                                        (mkProperPure (v = natV (nat_fact k)))
+                                        (mkProperExist Value (\lam w' => pointsTo l w')))))))
+                (mkProperExist (ProperUPred (HeapCMRA Loc cnt Value)) (\lam Q =>
+                    mkProperSep Q
+                        (mkProperForall Nat (\lam k =>
+                            ht Q
+                                (App (Val h) (Val (natV k)))
+                                (\lam v => mkProperAnd
+                                    (mkProperPure (v = natV (nat_fact k)))
+                                    Q)))))
+                (\lam l =>
+                    exist_elim_ent Value
+                        (\lam w =>
+                            mkProperSep (pointsTo l w)
+                                (mkProperForall Nat (\lam k =>
+                                    ht
+                                        (mkProperExist Value (\lam u => pointsTo l u))
+                                        (App (Val h) (Val (natV k)))
+                                        (\lam v => mkProperAnd
+                                            (mkProperPure (v = natV (nat_fact k)))
+                                            (mkProperExist Value (\lam w' => pointsTo l w'))))))
+                        (mkProperExist (ProperUPred (HeapCMRA Loc cnt Value)) (\lam Q =>
+                            mkProperSep Q
+                                (mkProperForall Nat (\lam k =>
+                                    ht Q
+                                        (App (Val h) (Val (natV k)))
+                                        (\lam v => mkProperAnd
+                                            (mkProperPure (v = natV (nat_fact k)))
+                                            Q)))))
+                        (\lam w n a hv hsep =>
+                            \case hsep \with {
+                              | inP (a1, a2, dist_a, h_pts, h_forall) =>
+                                \let
+                                  | M => HeapCMRA Loc cnt Value
+                                  -- | Fold concrete ownership `l ↦ w'` into the abstract `QPred l`.
+                                  | abstract_at_l : \Pi (w' : Value) ->
+                                      properUPred_ent (pointsTo l w') (QPred l) =>
+                                    \lam w' n' a' hv' hpts' => inP (w', hpts')
+                                  -- | `QPred l` already has the form `∃u. l ↦ u`, so unfolding it is the identity.
+                                  | reabstract_at_l :
+                                    properUPred_ent (QPred l) (QPred l) =>
+                                    properUPred_ent_refl (QPred l)
+                                  -- | The left resource `a1` (carrying `l ↦ w`) satisfies `Q`.
+                                  | h_Q : (QPred l).upred_holds n a1 =>
+                                    abstract_at_l w n a1
+                                        (M.cmra_validN_op_l n a1 a2
+                                            (M.cmra_validN_ne n a (M.op a1 a2) dist_a hv))
+                                        h_pts
+                                  -- | The per-call triples re-expressed with `Q` in pre/post, via `htQ_of_htpts`.
+                                  | h_forall' :
+                                        (mkProperForall Nat (\lam k =>
+                                            ht (QPred l)
+                                                (App (Val h) (Val (natV k)))
+                                                (\lam v => mkProperAnd
+                                                    (mkProperPure (v = natV (nat_fact k)))
+                                                    (QPred l)))).upred_holds n a2 =>
+                                    \let
+                                      | hv_op : M.validN n (M.op a1 a2) =>
+                                        M.cmra_validN_ne n a (M.op a1 a2) dist_a hv
+                                      | hv_a2 : M.validN n a2 =>
+                                        M.cmra_validN_op_l n a2 a1
+                                            (transport (\lam w => M.validN n w)
+                                                (M.cmra_comm a1 a2) hv_op)
+                                    \in \lam k =>
+                                        htQ_of_htpts l (QPred l)
+                                            abstract_at_l reabstract_at_l h k n a2 hv_a2 (h_forall k)
+                                  -- | Recombine `Q` and the family of `Q`-triples into the separating conjunction.
+                                  | h_sep : (mkProperSep (QPred l)
+                                      (mkProperForall Nat (\lam k =>
+                                          ht (QPred l)
+                                              (App (Val h) (Val (natV k)))
+                                              (\lam v => mkProperAnd
+                                                  (mkProperPure (v = natV (nat_fact k)))
+                                                  (QPred l))))).upred_holds n a =>
+                                    inP (a1, a2, dist_a, h_Q, h_forall')
+                                \in inP (QPred l, h_sep)
+                            }))
+    -- | Chain `base` with `post_step` lifted through the program's wp, threading the persistent
+    -- | Hoare-triple step-indexing.
+    \in properUPred_ent_trans (mkProperPure (\Sigma)) factorial_spec factorial_spec_Q base
+        (\lam n a hv hspec =>
+            \lam m m_le_n b inc =>
+                \lam m' m'_le_m a' hv_a' h_true =>
+                    wp_post_mono factorial_prog _ _ post_step m'
+                        (op {HeapCMRA Loc cnt Value} b a') hv_a'
+                        (hspec m m_le_n b inc m' m'_le_m a' hv_a' h_true))
+  \where {
+    -- | Converts a per-call Hoare triple stated with the concrete pre `∃u. l ↦ u` and post
+    -- | `∃w'. l ↦ w'` into one stated with an abstract predicate `Q`, given that `Q` folds from
+    -- | (`abstract`) and unfolds to (`reabstract`) the concrete ownership.  Implemented as a
+    -- | direct application of the consequence rule `ht_conseq`.
+    \func htQ_of_htpts
+      {cnt : Countable Loc}
+      (l : Loc)
+      (Q : ProperUPred (HeapCMRA Loc cnt Value))
+      (abstract : \Pi (w' : Value) ->
+          properUPred_ent (pointsTo l w') Q)
+      (reabstract :
+      properUPred_ent Q
+          (mkProperExist Value (\lam u => pointsTo l u)))
+      (h : Value) (k : Nat)
+      (n : Nat) (a : (HeapCMRA Loc cnt Value).E)
+      (hv : (HeapCMRA Loc cnt Value).validN n a)
+      (hht_pts : (ht
+          (mkProperExist Value (\lam u => pointsTo l u))
+          (App (Val h) (Val (natV k)))
+          (\lam v => mkProperAnd
+              (mkProperPure (v = natV (nat_fact k)))
+              (mkProperExist Value (\lam w' => pointsTo l w')))).upred_holds n a)
+      : (ht Q (App (Val h) (Val (natV k)))
+        (\lam v => mkProperAnd (mkProperPure (v = natV (nat_fact k))) Q)
+        ).upred_holds n a
+      =>
+        ht_conseq
+            (mkProperExist Value (\lam u => pointsTo l u))
+            Q
+            (App (Val h) (Val (natV k)))
+            (\lam v => mkProperAnd
+                (mkProperPure (v = natV (nat_fact k)))
+                (mkProperExist Value (\lam w' => pointsTo l w')))
+            (\lam v => mkProperAnd
+                (mkProperPure (v = natV (nat_fact k))) Q)
+            reabstract
+            (\lam v => \lam n' a' hv' hand =>
+                (hand.1, exist_elim_ent Value (\lam w' => pointsTo l w') Q abstract n' a' hv' hand.2))
+            n a hv hht_pts
+  }

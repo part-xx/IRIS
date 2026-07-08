@@ -1,0 +1,359 @@
+I have enough context. Here is the commented file:
+
+````
+\import Logic
+\import Logic.Meta
+\import Paths
+\import Paths.Meta
+\import Set
+\import Data.Maybe
+\import Arith.Nat
+\import Order.PartialOrder
+\import ofe
+\import cmra
+\import uPred
+\import lang
+\import interface
+\import lib.excl_cmra
+\import lib.auth_cmra
+\import lib.gmap_cmra
+
+
+-- | The heap (points-to) ghost theory for the Iris formalization in Arend.
+-- |
+-- | This module instantiates the standard Iris heap resource algebra
+-- | `Auth (gmap Loc (Excl Val))` and builds the points-to connective `l ↦ v`
+-- | on top of it.  The authoritative element (held by the physical state
+-- | interpretation) tracks the whole heap, while exclusive singleton fragments
+-- | (held by threads) record ownership of individual locations.
+-- |
+-- | Contents:
+-- |   * `HeapCMRA` — the underlying unital CMRA `Auth (gmap Loc (Excl Val))`;
+-- |   * `heap_frag` / `heap_auth` — the fragment and authoritative carriers;
+-- |   * `pointsTo` — the `l ↦ v` proposition as a `ProperUPred`;
+-- |   * the core ghost laws: `heap_agree` (l ↦ v1 ∗ l ↦ v2 ⊢ v1 = v2),
+-- |     `heap_exclusive` (l ↦ v ∗ l ↦ v ⊢ False) and `heap_frame`;
+-- |   * `HeapBI` — the BI structure of uPred over `HeapCMRA`;
+-- |   * concrete heap operations (`heap_lookup`, `heap_update`, `heap_alloc`)
+-- |     and the frame-preserving update obligations used by alloc/store.
+-- |
+-- | The exclusivity of `Excl` is exactly what makes points-to fragments
+-- | non-duplicable and lets us derive the agreement/disjointness laws above.
+
+
+-- =================================================================================
+-- Heap CMRA: AUTH (gmap (Loc, ExclU(Val)))
+--
+-- NOTE: After the Gmap redefinition, `Gmap K cnt A` now takes an explicit
+-- `Countable K` instance.  Decidability of equality comes from `cnt`, so we no
+-- longer thread a separate `dec` parameter through the heap API.
+-- =================================================================================
+
+
+-- | The heap resource algebra `Auth (gmap Loc (Excl Val))`.
+-- | `Val` is wrapped in a `DiscreteOFE` (no step-indexing on values), each cell
+-- | holds an `Excl` so a location can be owned by at most one fragment, and the
+-- | `Auth` layer separates the global authoritative heap from local fragments.
+\func HeapCMRA (Loc : \Set) (cnt : Countable Loc) (Val : \Set) : UCMRA =>
+  AuthUCMRA (GmapUCMRA Loc cnt (ExclUCMRA (DiscreteOFE Val)))
+
+-- | A singleton gmap `{k ↦ v}` built through the current gmap API (`gsingleton`).
+\func gmap_singleton {K : \Set} {cnt : Countable K} {V : \Set} (k : K) (v : V) : Gmap K cnt V =>
+  gsingleton k v
+
+
+-- | The fragment carrier for `l ↦ v`: an auth element with no authoritative part
+-- | (`nothing`) and the exclusive singleton fragment `{l ↦ excl v}`.
+\func heap_frag {Loc : \Set} {cnt : Countable Loc} {Val : \Set} (l : Loc) (v : Val)
+  : (HeapCMRA Loc cnt Val).E =>
+  (nothing, gmap_singleton l (just (excl v)))
+
+-- | The authoritative carrier for a whole heap `m`: an auth element with
+-- | authoritative part `excl m` and empty fragment.  Held by the state interpretation.
+\func heap_auth {Loc : \Set} {cnt : Countable Loc} {Val : \Set}
+                (m : Gmap Loc cnt (Maybe (Excl Val))) : (HeapCMRA Loc cnt Val).E =>
+  (just (excl m), gempty)
+
+
+-- =================================================================================
+-- Points-to connective
+-- =================================================================================
+
+
+-- | The points-to proposition `l ↦ v` as a step-indexed uPred over `HeapCMRA`.
+-- | It holds at `(n, a)` iff `heap_frag l v` is `n`-included in `a`, i.e. owning
+-- | `a` entails owning the exclusive fragment for `l`.  Monotonicity in both the
+-- | step index and the resource is discharged by `heap_incl_trans`.
+\func pointsTo {Loc : \Set} {cnt : Countable Loc} {Val : \Set} (l : Loc) (v : Val)
+  : ProperUPred (HeapCMRA Loc cnt Val) \cowith
+  | upred_holds => \lam n a =>
+      inclN {HeapCMRA Loc cnt Val}
+          {\new Op (HeapCMRA Loc cnt Val).E { | op => (HeapCMRA Loc cnt Val).op }}
+          (heap_frag l v) n a
+  | upred_mono => \lam n1 n2 x1 x2 h_incl incl_x1_x2 n2_le_n1 =>
+      heap_incl_trans n1 n2 (heap_frag l v) x1 x2 h_incl incl_x1_x2 n2_le_n1
+
+-- =================================================================================
+-- Helper lemmas for points-to
+-- =================================================================================
+
+-- | Transitivity of step-indexed inclusion, downgrading to the smaller index `n2`.
+-- | From `a ≼{n1} b` and `b ≼{n2} c` with `n2 ≤ n1`, derives `a ≼{n2} c`.
+-- | Proof idea: combine the two witnesses `z1, z2` into `z1 · z2`, then rewrite
+-- | with associativity and contract `b ≡{n1} a · z1` down to index `n2` using
+-- | `ofe_dist_le`, finally chaining the distances by transitivity.
+\func heap_incl_trans {Loc : \Set} {cnt : Countable Loc} {Val : \Set} (n1 n2 : Nat)
+                      (a b c : (HeapCMRA Loc cnt Val).E)
+                      (h1 : inclN {HeapCMRA Loc cnt Val}
+                          {\new Op (HeapCMRA Loc cnt Val).E { | op => (HeapCMRA Loc cnt Val).op }} a n1 b)
+                      (h2 : inclN {HeapCMRA Loc cnt Val}
+                          {\new Op (HeapCMRA Loc cnt Val).E { | op => (HeapCMRA Loc cnt Val).op }} b n2 c)
+                      (le : n2 <= n1)
+  : inclN {HeapCMRA Loc cnt Val}
+    {\new Op (HeapCMRA Loc cnt Val).E { | op => (HeapCMRA Loc cnt Val).op }} a n2 c
+  => \case h1, h2 \with {
+    | inP (z1, dist_b_az1), inP (z2, dist_c_bz2) =>
+      \let M => HeapCMRA Loc cnt Val
+      \in inP (M.op z1 z2,
+               M.ofe_dist_trans n2 c (M.op b z2) (M.op a (M.op z1 z2))
+                   dist_c_bz2
+                   (transport (\lam w => M.dist n2 (M.op b z2) w)
+                       (inv (M.cmra_assoc a z1 z2))
+                       (M.cmra_op_ne_2 z2 n2 b (M.op a z1)
+                           (M.ofe_dist_le n1 n2 b (M.op a z1) dist_b_az1 le))))
+  }
+
+
+-- =================================================================================
+-- Heap lemmas
+-- =================================================================================
+
+
+-- | Validity at the gmap layer for two overlapping fragments at the same location.
+-- | Given `a1 · a2` is `n`-valid and `a1`, `a2` satisfy `l ↦ v1`, `l ↦ v2`, the
+-- | composed singletons `{l ↦ excl v1} · {l ↦ excl v2}` are `n`-valid in the gmap
+-- | CMRA.  Bridges the auth-level validity to a pointwise statement about cell `l`.
+\func heap_agree_gmap_valid {Loc : \Set} {cnt : Countable Loc} {Val : \Set}
+                            (n : Nat)
+                            (a1 a2 : (HeapCMRA Loc cnt Val).E)
+                            (l : Loc) (v1 v2 : Val)
+                            (hv_op : (HeapCMRA Loc cnt Val).validN n
+                                ((HeapCMRA Loc cnt Val).op a1 a2))
+                            (hfrag1 : (pointsTo l v1).upred_holds n a1)
+                            (hfrag2 : (pointsTo l v2).upred_holds n a2)
+  : (GmapUCMRA Loc cnt (ExclUCMRA (DiscreteOFE Val))).validN n
+    ((GmapUCMRA Loc cnt (ExclUCMRA (DiscreteOFE Val))).op
+        (gmap_singleton l (just (excl v1)))
+        (gmap_singleton l (just (excl v2))))
+  => {?}
+
+-- | Agreement law: `l ↦ v1 ∗ l ↦ v2 ⊢ ⌜v1 = v2⌝`.
+-- | Two points-to assertions for the same location force the values to agree.
+-- | Proof idea: from the separating conjunction get `a1 · a2` valid, push this to
+-- | the gmap layer (`heap_agree_gmap_valid`), look up location `l`, rewrite the
+-- | lookup of the composed singletons to `excl v1 · excl v2`, whose validity is
+-- | `excl_validN n exclInvalid` — which is absurd, so `\case` closes every branch.
+\func heap_agree {Loc : \Set} {cnt : Countable Loc} {Val : \Set} {l : Loc} {v1 v2 : Val}
+  : properUPred_ent {HeapCMRA Loc cnt Val}
+    (mkProperSep (pointsTo l v1) (pointsTo l v2))
+    (mkProperPure (v1 = v2))
+  => \lam n a hv hsep =>
+      \let M => HeapCMRA Loc cnt Val
+           | G => GmapUCMRA Loc cnt (ExclUCMRA (DiscreteOFE Val))
+      \in \case hsep \with {
+        | inP (a1, a2, dist_a, hfrag1, hfrag2) =>
+          \let
+            | hv_op : M.validN n (M.op a1 a2) =>
+              M.cmra_validN_ne n a (M.op a1 a2) dist_a hv
+            | hv_gmap : G.validN n (G.op (gmap_singleton l (just (excl v1)))
+                (gmap_singleton l (just (excl v2))))
+            => heap_agree_gmap_valid n a1 a2 l v1 v2 hv_op hfrag1 hfrag2
+            | at_l : option_validN {ExclUCMRA (DiscreteOFE Val)} n
+                (glookup (G.op (gmap_singleton l (just (excl v1))) (gmap_singleton l (just (excl v2)))) l) =>
+              hv_gmap l
+            | at_l' : option_validN {ExclUCMRA (DiscreteOFE Val)} n
+                (option_op {ExclUCMRA (DiscreteOFE Val)}
+                    (glookup (gmap_singleton l (just (excl v1))) l)
+                    (glookup (gmap_singleton l (just (excl v2))) l)) =>
+              transport (option_validN {ExclUCMRA (DiscreteOFE Val)} n)
+                  (glookup_op (gmap_singleton l (just (excl v1))) (gmap_singleton l (just (excl v2))) l)
+                  at_l
+            | at_l'' : excl_validN n (excl_op (excl v1) (excl v2)) =>
+              transport2 (\lam x y => option_validN {ExclUCMRA (DiscreteOFE Val)} n (option_op {ExclUCMRA (DiscreteOFE Val)} x y))
+                  (glookup_singleton_eq l (just (excl v1)))
+                  (glookup_singleton_eq l (just (excl v2)))
+                  at_l'
+          \in \case at_l''
+      }
+
+-- | Exclusivity law: `l ↦ v ∗ l ↦ v ⊢ False`.
+-- | A location cannot be owned twice; combining two identical fragments is invalid.
+-- | Proof mirrors `heap_agree`: it reduces to validity of `excl v · excl v`, which
+-- | computes to `exclInvalid` and has empty validity, giving the contradiction.
+\func heap_exclusive {Loc : \Set} {cnt : Countable Loc} {Val : \Set} {l : Loc} {v : Val}
+  : properUPred_ent {HeapCMRA Loc cnt Val}
+    (mkProperSep (pointsTo l v) (pointsTo l v))
+    (mkProperPure Empty)
+  => \lam n a hv hsep =>
+      \let M => HeapCMRA Loc cnt Val
+           | G => GmapUCMRA Loc cnt (ExclUCMRA (DiscreteOFE Val))
+      \in \case hsep \with {
+        | inP (a1, a2, dist_a, hfrag1, hfrag2) =>
+          \let
+            | hv_op : M.validN n (M.op a1 a2) =>
+              M.cmra_validN_ne n a (M.op a1 a2) dist_a hv
+            | hv_gmap : G.validN n (G.op (gmap_singleton l (just (excl v))) (gmap_singleton l (just (excl v))))
+            => heap_agree_gmap_valid n a1 a2 l v v hv_op hfrag1 hfrag2
+            | at_l : option_validN {ExclUCMRA (DiscreteOFE Val)} n
+                (glookup (G.op (gmap_singleton l (just (excl v))) (gmap_singleton l (just (excl v)))) l) =>
+              hv_gmap l
+            | at_l' : option_validN {ExclUCMRA (DiscreteOFE Val)} n
+                (option_op {ExclUCMRA (DiscreteOFE Val)}
+                    (glookup (gmap_singleton l (just (excl v))) l)
+                    (glookup (gmap_singleton l (just (excl v))) l)) =>
+              transport (option_validN {ExclUCMRA (DiscreteOFE Val)} n)
+                  (glookup_op (gmap_singleton l (just (excl v))) (gmap_singleton l (just (excl v))) l)
+                  at_l
+            | at_l'' : excl_validN n (excl_op (excl v) (excl v)) =>
+              transport2 (\lam x y => option_validN {ExclUCMRA (DiscreteOFE Val)} n (option_op {ExclUCMRA (DiscreteOFE Val)} x y))
+                  (glookup_singleton_eq l (just (excl v)))
+                  (glookup_singleton_eq l (just (excl v)))
+                  at_l'
+          \in at_l''
+      }
+
+-- | Framing law: `l ↦ v ⊢ l ↦ v ∗ emp`.
+-- | Splits a points-to into itself and the empty resource, witnessing the right
+-- | conjunct by the unit.  Proof manipulates the inclusion witness using the
+-- | unit identity laws (`ucmra_unit_left_id` / `ucmra_unit_right_id`).
+\func heap_frame {Loc : \Set} {cnt : Countable Loc} {Val : \Set} {l : Loc} {v : Val}
+  : properUPred_ent {HeapCMRA Loc cnt Val}
+    (pointsTo l v)
+    (mkProperSep (pointsTo l v) mkProperEmp)
+  => \lam n a hv h_incl =>
+      \let M => HeapCMRA Loc cnt Val
+           | frag => heap_frag l v
+      \in \case h_incl \with {
+        | inP (z, dist_a_fragz) =>
+          inP (frag, M.op M.unit z,
+               transport (\lam w => M.dist n a w)
+                   (pmap (M.op frag) (inv (M.ucmra_unit_left_id z)))
+                   dist_a_fragz,
+               inP (M.unit,
+                    transport (\lam w => M.dist n frag w)
+                        (inv (ucmra_unit_right_id frag))
+                        (M.ofe_dist_refl n frag)),
+               inP (z, M.ofe_dist_refl n (M.op M.unit z)))
+      }
+
+-- | Monotonicity of separating conjunction under a points-to rewrite.
+-- | If `l1 ↦ v1 ⊢ l2 ↦ v2`, then framing `l3 ↦ v3` on the right preserves it:
+-- | `l1 ↦ v1 ∗ l3 ↦ v3 ⊢ l2 ↦ v2 ∗ l3 ↦ v3`.  Proof splits the conjunction,
+-- | extracts validity of the left component, and applies the hypothesis there.
+\lemma sep_frame_pointsTo {Loc : \Set} {cnt : Countable Loc} {Val : \Set}
+                          {l1 l2 l3 : Loc} {v1 v2 v3 : Val}
+                          (h : properUPred_ent {HeapCMRA Loc cnt Val}
+                              (pointsTo l1 v1)
+                              (pointsTo l2 v2))
+  : properUPred_ent {HeapCMRA Loc cnt Val}
+    (mkProperSep (pointsTo l1 v1) (pointsTo l3 v3))
+    (mkProperSep (pointsTo l2 v2) (pointsTo l3 v3))
+  => \lam n a hv hsep =>
+      \let M => HeapCMRA Loc cnt Val \in
+        \case hsep \with {
+          | inP (a1, a2, dist_a, hp1, hp3) =>
+            \let
+              | hv_op : M.validN n (M.op a1 a2) =>
+                M.cmra_validN_ne n a (M.op a1 a2) dist_a hv
+              | hv_a1 : M.validN n a1 =>
+                M.cmra_validN_op_l n a1 a2 hv_op
+            \in inP (a1, a2, dist_a, h n a1 hv_a1 hp1, hp3)
+        }
+
+-- =================================================================================
+-- BI instance for heap
+-- =================================================================================
+
+
+-- | The BI (bunched-implications) algebra of step-indexed propositions over
+-- | `HeapCMRA`.  This is the logic in which heap Hoare triples / weakest
+-- | preconditions are stated; `pointsTo` lives as one of its propositions.
+\func HeapBI (Loc : \Set) (cnt : Countable Loc) (Val : \Set) : BIBase =>
+  BIuPred (HeapCMRA Loc cnt Val)
+
+
+-- =================================================================================
+-- Additional heap operations
+--
+-- These now look up / update through the Gmap API rather than treating the
+-- gmap as a plain function.
+-- =================================================================================
+
+
+-- | Reads the value stored at `l` in the physical heap.
+-- | Returns `nothing` for absent, empty (`just nothing`) or invalid cells, and
+-- | `just v` only for a well-formed exclusive cell `just (excl v)`.
+\func heap_lookup {Loc : \Set} {cnt : Countable Loc} {Val : \Set}
+                  (h : Gmap Loc cnt (Maybe (Excl Val))) (l : Loc) : Maybe Val =>
+  \case glookup h l \with {
+    | nothing => nothing
+    | just nothing => nothing
+    | just (just (excl v)) => just v
+    | just (just exclInvalid) => nothing
+  }
+
+-- | Writes value `v` at location `l`, overwriting any previous contents.
+-- | Used to model the store operation on the physical heap.
+\func heap_update {Loc : \Set} {cnt : Countable Loc} {Val : \Set}
+                  (h : Gmap Loc cnt (Maybe (Excl Val))) (l : Loc) (v : Val)
+  : Gmap Loc cnt (Maybe (Excl Val)) =>
+  ginsert l (just (excl v)) h
+
+-- | Allocates `l ↦ v` in the heap.  Identical to `heap_update`; the distinct
+-- | name documents intent at allocation sites (the location is expected fresh).
+\func heap_alloc {Loc : \Set} {cnt : Countable Loc} {Val : \Set}
+                 (h : Gmap Loc cnt (Maybe (Excl Val))) (l : Loc) (v : Val)
+  : Gmap Loc cnt (Maybe (Excl Val)) =>
+  heap_update h l v
+
+
+-- | Every concrete state has a fresh location: produces some `l` with
+-- | `s.heap[l] = nothing`.  This is the side condition that justifies allocation
+-- | steps in the operational semantics and the alloc frame-preserving update.
+\func heap_fresh_loc {cnt : Countable Loc} (s : State cnt)
+  : \Sigma (l : Loc) (glookup s.heap l = nothing)
+  => {?}
+
+-- Frame-preserving update: the auth view, opped with anything compatible,
+-- can be advanced to the post-allocation auth view, producing a fresh fragment.
+-- \func heap_alloc_update {cnt : Countable Loc}
+--                         (sigma : State cnt) (l : Loc) (v : Value)
+--                         (fresh : glookup sigma.heap l = nothing)
+--                         (n : Nat) (a2 : (HeapCMRA Loc cnt Value).E)
+--                         (hv : (HeapCMRA Loc cnt Value).validN n
+--                             ((HeapCMRA Loc cnt Value).op (heap_auth (heap_state_to_gmap sigma)) a2))
+--   : (bu.bupd (mkProperSep
+--     (own_heap_auth (\new State cnt { | cnt => sigma.cnt
+--                                      | heap => heap_update sigma.heap l v }))
+--     (pointsTo l v))).upred_holds n
+--     ((HeapCMRA Loc cnt Value).op (heap_auth (heap_state_to_gmap sigma)) a2)
+--   => {?}
+--
+--
+-- \func heap_store_update
+--   {cnt : Countable Loc}
+--   (bu     : BUpdNE)
+--   (sigma  : State cnt) (l : Loc) (u v : Value)
+--   (lookup : glookup sigma.heap l = just u)
+--   (n      : Nat) (a_frag : (HeapCMRA Loc cnt Value).E)
+--   (hv     : (HeapCMRA Loc cnt Value).validN n
+--       ((HeapCMRA Loc cnt Value).op
+--           (heap_auth (heap_state_to_gmap sigma)) a_frag))
+--   (hfrag  : (pointsTo l u).upred_holds n a_frag)
+--   : (bu.bupd (mkProperSep
+--     (own_heap_auth (\new State cnt {
+--       | cnt => sigma.cnt
+--       | heap => heap_update sigma.heap l v }))
+--     (pointsTo l v))).upred_holds n
+--     ((HeapCMRA Loc cnt Value).op (heap_auth (heap_state_to_gmap sigma)) a_frag)
+````

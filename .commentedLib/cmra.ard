@@ -1,0 +1,427 @@
+-- | CMRAs (Cameras) — the resource algebras at the heart of Iris.
+-- |
+-- | A CMRA is a step-indexed (OFE-enriched) generalization of a unital partial
+-- | commutative monoid with a partial core. It refines the notion of a resource
+-- | algebra so that validity and the core may depend on the step-index `n`,
+-- | which is what makes higher-order ghost state and recursive invariants sound.
+-- |
+-- | This module defines:
+-- |   * the component fields `PCore`, `Op`, `Valid`, `ValidN` and the `incl`/`inclN`
+-- |     (step-indexed) inclusion orders;
+-- |   * the `CMRA` class bundling the camera axioms (associativity, commutativity,
+-- |     the core laws, validity monotonicity and the crucial `cmra_extend` axiom);
+-- |   * `UCMRA`, the unital variant carrying a global unit element;
+-- |   * predicates on elements (`CoreId`, `Exclusive`, `Cancelable`, `CMRATotal`);
+-- |   * derived lemmas: non-expansiveness of `op`, validity under inclusion,
+-- |     transitivity/monotonicity of `inclN`, and the total core on a UCMRA.
+-- | These correspond to the `cmra`/`ucmra` structures and their basic theory in
+-- | the Iris Coq development (iris/algebra/cmra.v).
+\import Logic
+\import Logic.Meta
+\import Paths
+\import Set
+\import Data.Maybe
+\import Arith.Nat
+\import Order.PartialOrder
+\import ofe
+
+
+-- =================================================================================
+-- CMRA structure
+-- =================================================================================
+
+-- | Carrier of a partial core: `pcore x` returns the optional core of `x`
+-- | (`just c` when a core exists, `nothing` otherwise). The core is the largest
+-- | duplicable/persistent part of a resource.
+\class PCore (A : \Set)
+  | pcore : A -> Maybe A
+
+-- | Carrier of the (total) binary composition `op` combining two resources.
+\class Op (A : \Set)
+  | op : A -> A -> A
+
+-- | Infix `·` notation for resource composition `op x y`.
+\func \infixl 7 op_dot {A : \Set} {opA : Op A} (x y : A) : A => op x y
+
+-- | Composition with an *optional* operand: `op x y` when `my = just y`,
+-- | otherwise `x` itself. Used to state laws uniformly over `pcore` results.
+\func opM {A : \Set} {opA : Op A} (x : A) (my : Maybe A) : A \elim my
+  | just y  => op x y
+  | nothing => x
+
+-- | Carrier of (step-index-independent) validity: `valid x` holds when `x`
+-- | denotes a consistent resource.
+\class Valid (A : \Set)
+  | valid : A -> \Prop
+
+-- | Carrier of step-indexed validity: `validN n x` holds when `x` looks valid
+-- | up to `n` steps of computation.
+\class ValidN (A : \Set)
+  | validN : Nat -> A -> \Prop
+
+
+-- | Convenience wrapper for `valid x`.
+\func vld {A : \Set} {vA : Valid A} (x : A) : \Prop => valid x
+-- | Convenience wrapper for `validN n x`.
+\func vldN {A : \Set} {vnA : ValidN A} (n : Nat) (x : A) : \Prop => validN n x
+
+
+-- | Extension (inclusion) order: `x ≼ y` iff `y = op x z` for some frame `z`.
+-- | Captures "`x` is a part of `y`".
+\func \infix 6 incl {A : \Set} {eA : BaseSet A} {opA : Op A} (x y : A) : \Prop =>
+  ∃ (z : A) (y = op x z)
+
+-- | Step-indexed inclusion: `x ≼{n} y` iff `y` is `n`-equal to `op x z` for
+-- | some frame `z`. The OFE-level relaxation of `incl` used throughout Iris.
+\func \infix 6 inclN {O : OFE} {opO : Op O.E} (x : O.E) (n : Nat) (y : O.E) : \Prop =>
+  ∃ (z : O.E) (O.dist n y (op x z))
+
+
+-- | A CMRA (camera): an OFE equipped with composition, a partial core and
+-- | step-indexed validity satisfying the camera axioms. This is the central
+-- | structure used to build Iris resources and ghost state.
+\class CMRA \extends OFE, PCore, Op, Valid, ValidN {
+  | PCore.A => E
+  | Op.A => E
+  | Valid.A => E
+  | ValidN.A => E
+
+  -- | `op x` is non-expansive in its right argument.
+  | cmra_op_ne (x : E) : NonExpansive (op x)
+  -- | `op · y` is non-expansive in its left argument.
+  | cmra_op_ne_2 (y : E) : NonExpansive (\lam x => op x y)
+
+  -- | The core is non-expansive: `n`-equal elements have `n`-equal cores, and
+  -- | one having a core forces the other to have one too.
+  | cmra_pcore_ne (n : Nat) (x y : E) (cx : E) :
+  dist n x y -> pcore x = just cx ->
+  \Sigma (cy : E) (pcore y = just cy) (dist n cx cy)
+
+  -- | Step-indexed validity is non-expansive: it transports along `dist n`.
+  | cmra_validN_ne (n : Nat) (x y : E) : dist n x y -> validN n x -> validN n y
+
+  -- | Validity is the limit of step-indexed validity over all `n`.
+  | cmra_valid_validN (x : E) : valid x <-> (\Pi (n : Nat) -> validN n x)
+
+  -- | Step-indexed validity is downward closed in the step-index.
+  | cmra_validN_le (n m : Nat) (x : E) : validN n x -> m <= n -> validN m x
+
+  -- | Composition is associative.
+  | cmra_assoc (x y z : E) : op x (op y z) = op (op x y) z
+  -- | Composition is commutative.
+  | cmra_comm (x y : E) : op x y = op y x
+
+  -- | The core is a left unit for its element: if `pcore x = just cx` then `cx · x = x`.
+  | cmra_pcore_l (x cx : E) : pcore x = just cx -> op cx x = x
+  -- | The core is idempotent: the core of a core is itself.
+  | cmra_pcore_idemp (x cx : E) : pcore x = just cx -> pcore cx = just cx
+  -- | The core is monotone w.r.t. inclusion: if `x ≼ y` then `core x ≼ core y`.
+  | cmra_pcore_mono (x y cx : E) : incl {E} {\this} {\new Op E { | op => op }} x y -> pcore x = just cx ->
+  \Sigma (cy : E) (pcore y = just cy) (incl {E} {\this} {\new Op E { | op => op }} cx cy)
+
+  -- | Validity of a composite implies validity of its left factor.
+  | cmra_validN_op_l (n : Nat) (x y : E) : validN n (op x y) -> validN n x
+
+  -- | The extension axiom: a valid `x` that is `n`-equal to a split `y1 · y2`
+  -- | can itself be split into matching pieces `z1 · z2`. This is what allows
+  -- | resources to be "extended" along step-indexed equalities — essential for
+  -- | soundness of the model.
+  | cmra_extend (n : Nat) (x y1 y2 : E) :
+  validN n x -> dist n x (op y1 y2) ->
+  \Sigma (z1 z2 : E) (x = op z1 z2) (dist n z1 y1) (dist n z2 y2)
+}
+
+-- =================================================================================
+-- UCMRA: Unital CMRA (with unit element)
+-- =================================================================================
+
+-- | Carrier of a distinguished unit element `unit`.
+\class Unit (A : \Set)
+  | unit : A
+
+-- | A unital CMRA (UCMRA): a CMRA with a unit `ε` that is valid, a left identity
+-- | for composition, and its own core. Most Iris resource algebras are unital.
+\class UCMRA \extends CMRA, Unit{
+  | Unit.A => E
+
+  -- | The unit is always valid.
+  | ucmra_unit_valid : valid unit
+  -- | The unit is a left identity for composition.
+  | ucmra_unit_left_id : \Pi (x : E) -> op unit x = x
+  -- | The unit is its own core.
+  | ucmra_pcore_unit : pcore unit = just unit
+}
+
+-- | `x` is core-identity (persistent) when it equals its own core, `pcore x = just x`.
+\func CoreId {C : CMRA} (x : C.E) : \Prop => pcore {C} x = just x
+
+-- | `x` is exclusive when it is incompatible with every other resource:
+-- | `op x y` is never valid even at step 0.
+\func Exclusive {C : CMRA} (x : C.E) : \Prop =>
+  \Pi (y : C.E) -> validN {C} 0 (op {C} x y) -> Empty
+
+-- | `x` is cancelable when it can be cancelled on the left of `op` under
+-- | validity: `op x y =={n} op x z` implies `y =={n} z`.
+\func Cancelable {C : CMRA} (x : C.E) : \Prop =>
+  \Pi (n : Nat) (y z : C.E) -> validN {C} n (op {C} x y) -> C.dist n (op {C} x y) (op {C} x z) -> C.dist n y z
+
+-- | A CMRA is total when every element has a core (`pcore` is total).
+\func CMRATotal (C : CMRA) : \Prop =>
+  \Pi (x : C.E) -> TruncP(\Sigma (cx : C.E) (pcore {C} x = just cx))
+
+-- =================================================================================
+-- Basic CMRA lemmas
+-- =================================================================================
+
+-- | `op` is non-expansive in both arguments at once: combining the two
+-- | one-sided non-expansiveness facts via transitivity of `dist`.
+\lemma cmra_op_ne_both {C : CMRA} (n : Nat) (x1 x2 y1 y2 : C.E)
+                       (h1 : C.dist n x1 x2) (h2 : C.dist n y1 y2) :
+  C.dist n (op {C} x1 y1) (op {C} x2 y2) =>
+  C.ofe_dist_trans n (op {C} x1 y1) (op {C} x2 y1) (op {C} x2 y2)
+    (cmra_op_ne_2 {C} y1 n x1 x2 h1)
+    (cmra_op_ne {C} x2 n y1 y2 h2)
+
+-- | Right-hand mirror of `cmra_validN_op_l`: validity of `op x y` implies
+-- | validity of `y`, obtained by commuting the composite.
+\lemma cmra_validN_op_r {C : CMRA} (n : Nat) (x y : C.E) :
+  validN {C} n (op {C} x y) -> validN {C} n y =>
+  \lam h => cmra_validN_op_l {C} n y x (transport (validN {C} n) (cmra_comm {C} x y) h)
+
+
+-- | Validity is downward closed along step-indexed inclusion: if `y` is valid
+-- | and `x ≼{n} y`, then `x` is valid. Proof: transport validity along the
+-- | witnessing distance, then strip the right factor with `cmra_validN_op_l`.
+\lemma cmra_validN_includedN {C : CMRA} (n : Nat) (x y : C.E)
+                             (hv : validN {C} n y)
+                             (h : inclN {C} {\new Op C.E { | op => C.op }} x n y)
+  : validN {C} n x => \case h \with {
+  | inP (z, dist_y_xz) =>
+    cmra_validN_op_l {C} n x z
+        (cmra_validN_ne {C} n y (op {C} x z) dist_y_xz hv)
+}
+
+-- | Right version of `cmra_pcore_l`: if `pcore x = just cx` then `x · cx = x`.
+\lemma cmra_pcore_r {C : CMRA} (x cx : C.E) :
+  pcore {C} x = just cx -> op {C} x cx = x =>
+  \lam h => transport (\lam z => z = x) (cmra_comm {C} cx x) (cmra_pcore_l {C} x cx h)
+
+-- | The unit is also a right identity: `op x ε = x`, derived from the left
+-- | identity law and commutativity.
+\lemma ucmra_unit_right_id {U : UCMRA} (x : U.E) : op {U} x U.unit = x =>
+  transport (\lam z => z = x) (inv (U.cmra_comm x U.unit)) (U.ucmra_unit_left_id x)
+
+-- | A factor is step-indexed-included in its composite: `x ≼{n} (x · y)`,
+-- | with witness `y` and reflexivity of `dist`.
+\func cmra_includedN_l {C : CMRA} (n : Nat) (x y : C.E) : inclN {C} {\new Op C.E { | op => C.op }} x n (C.op x y) =>
+  inP (y, C.ofe_dist_refl n (C.op x y))
+
+-- | Step-indexed inclusion is downward closed in the step-index:
+-- | `x ≼{n} y` and `m ≤ n` give `x ≼{m} y`.
+\func inclN_le {O : OFE} {opO : Op O.E} (x y : O.E) (n m : Nat)
+               (h : inclN {O} {opO} x n y) (le : m <= n) : inclN {O} {opO} x m y
+  => \case h \with {
+    | inP (z, dist_y_xz) => inP (z, O.ofe_dist_le n m y (opO.op x z) dist_y_xz le)
+  }
+
+-- | Non-expansiveness of `op` in the left argument, as a standalone lemma.
+\func dist_op_ne_l {M : CMRA} (n : Nat) (x1 x2 y : M.E)
+                   (h : M.dist n x1 x2) : M.dist n (M.op x1 y) (M.op x2 y)
+  => M.cmra_op_ne_2 y n x1 x2 h
+
+-- | Non-expansiveness of `op` in the right argument, as a standalone lemma.
+\func dist_op_ne_r {M : CMRA} (n : Nat) (x y1 y2 : M.E)
+                   (h : M.dist n y1 y2) : M.dist n (M.op x y1) (M.op x y2)
+  => M.cmra_op_ne x n y1 y2 h
+
+-- | `x ≼{n} (x · y)`; same as `cmra_includedN_l`, spelled with the explicit `Op` instance.
+\func inclN_op_l {M : CMRA} (n : Nat) (x y : M.E) : inclN {M} {\new Op M.E { | op => M.op }} x n (M.op x y)
+  => inP (y, M.ofe_dist_refl n (M.op x y))
+
+-- | Step-indexed inclusion is preserved by composing with a common frame on the
+-- | right: `x1 ≼{n} x2` implies `x1 · a ≼{n} x2 · a`. The frame witness is reused,
+-- | rearranging `(x1 · z) · a` into `(x1 · a) · z` via associativity/commutativity.
+\func inclN_op_r {M : CMRA} (n : Nat) (x1 x2 a : M.E)
+                 (h : inclN {M} {\new Op M.E { | op => M.op }} x1 n x2)
+  : inclN {M} {\new Op M.E { | op => M.op }} (M.op x1 a) n (M.op x2 a)
+  => \case h \with {
+    | inP (z, dist_x2_x1z) =>
+      inP (z,
+           transport (\lam w => M.dist n (M.op x2 a) w)
+             (inv (M.cmra_assoc x1 z a)
+               *> pmap (M.op x1) (M.cmra_comm z a)
+                    *> M.cmra_assoc x1 a z)
+             (M.cmra_op_ne_2 a n x2 (M.op x1 z) dist_x2_x1z))
+  }
+
+-- | Transitivity of step-indexed inclusion: `x ≼{n} y` and `y ≼{n} w` give
+-- | `x ≼{n} w`. The combined frame is `z1 · z2`; the distance is assembled by
+-- | chaining the two witnesses through associativity of `op`.
+\lemma inclN_trans {C : CMRA} (n : Nat) (x y w : C.E)
+                   (h1 : inclN {C} {\new Op C.E { | op => C.op }} x n y)
+                   (h2 : inclN {C} {\new Op C.E { | op => C.op }} y n w)
+  : inclN {C} {\new Op C.E { | op => C.op }} x n w
+  => \case h1, h2 \with {
+    | inP (z1, hz1), inP (z2, hz2) =>
+      inP (C.op z1 z2,
+           C.ofe_dist_trans n w (C.op y z2) (C.op x (C.op z1 z2))
+               hz2
+               (C.ofe_dist_trans n (C.op y z2) (C.op (C.op x z1) z2) (C.op x (C.op z1 z2))
+                   (C.cmra_op_ne_2 z2 n y (C.op x z1) hz1)
+                   (equiv_dist_n {C} (C.op (C.op x z1) z2) (C.op x (C.op z1 z2))
+                       (inv (C.cmra_assoc x z1 z2)) n)))
+  }
+
+-- =================================================================================
+-- Derived laws
+-- =================================================================================
+
+-- | Non-expansiveness of the (optional) core stated at the `OptionOFE` level:
+-- | if `x =={n} y` then `pcore x` and `pcore y` are `n`-equal as `Maybe` values.
+-- | Proof by case analysis on the two results, using `cmra_pcore_ne` to force the
+-- | `just`/`just` case and to rule out the mismatched `just`/`nothing` cases.
+\lemma cmra_pcore_ne_dist {C : CMRA} (n : Nat) (x y : C.E)
+                          (h : C.dist n x y) (px py : Maybe C.E)
+                          (hx : pcore {C} x = px) (hy : pcore {C} y = py)
+  : (OptionOFE C).dist n px py
+  => \case px \as px', py \as py', hx : pcore {C} x = px', hy : pcore {C} y = py'
+  \return (OptionOFE C).dist n px' py'
+  \with {
+    | just cx, just cy, hx, hy =>
+      \case C.cmra_pcore_ne n x y cx h hx \with {
+        | (cy', hy', dcx_cy') =>
+          \let cy_eq : just cy' = just cy =>
+            transport (\lam z => z = just cy) hy' hy
+          \in transport (\lam z => C.dist n cx z)
+              (pmap (\case __ \with { | just c => c | nothing => cy' }) cy_eq)
+              dcx_cy'
+      }
+    | nothing, nothing, _, _ => ()
+    | just cx, nothing, hx, hy =>
+      \case C.cmra_pcore_ne n x y cx h hx \with {
+        | (_, hy', _) =>
+          \case transport (\lam z => z = nothing) hy' hy
+                : (just _ : Maybe C.E) = nothing \with {}
+      }
+    | nothing, just cy, hx, hy =>
+      \case C.cmra_pcore_ne n y x cy (C.ofe_dist_sym n x y h) hy \with {
+        | (_, hx', _) =>
+          \case transport (\lam z => z = nothing) hx' hx
+                : (just _ : Maybe C.E) = nothing \with {}
+      }
+  }
+
+-- =================================================================================
+-- Total core on a UCMRA
+-- =================================================================================
+
+-- | The *total* core on a UCMRA: returns the partial core when it exists and the
+-- | unit `ε` otherwise. Since UCMRAs always have a unit, this gives a total
+-- | `core` function satisfying the usual core laws (proved below).
+\func ucmra_core {U : UCMRA} (x : U.E) : U.E =>
+  \case pcore {U} x \with {
+    | just c  => c
+    | nothing => U.unit
+  }
+
+-- | The unit is the least element of the inclusion order: `ε ≼ x` for every `x`
+-- | (witnessed by `x` itself, using the left-identity law).
+\lemma ucmra_unit_least {U : UCMRA} (x : U.E)
+  : incl {U.E} {U} {\new Op U.E { | op => U.op }} U.unit x
+  => inP (x, inv (U.ucmra_unit_left_id x))
+
+-- | The total core is non-expansive. Proof by case analysis on `pcore x`/`pcore y`:
+-- | the `just`/`just` case uses `cmra_pcore_ne`, the `nothing`/`nothing` case is
+-- | reflexivity on `ε`, and the mixed cases are impossible by `cmra_pcore_ne`.
+\lemma ucmra_core_ne {U : UCMRA} (n : Nat) (x y : U.E)
+                     (h : U.dist n x y)
+  : U.dist n (ucmra_core x) (ucmra_core y)
+  => \case pcore {U} x \as px, pcore {U} y \as py,
+           idp : pcore {U} x = px, idp : pcore {U} y = py
+  \return U.dist n
+      (\case px \with { | just c => c | nothing => U.unit })
+      (\case py \with { | just c => c | nothing => U.unit })
+  \with {
+    | just cx, just cy, hpx, hpy =>
+      \case U.cmra_pcore_ne n x y cx h hpx \with {
+        | (cy', hpy', dcxcy') =>
+          \let cy_eq : cy' = cy =>
+            pmap (\case __ \with { | just c => c | nothing => cy' })
+                (transport (\lam z => z = just cy) hpy' hpy)
+          \in transport (\lam z => U.dist n cx z) cy_eq dcxcy'
+      }
+    | nothing, nothing, _, _ => U.ofe_dist_refl n U.unit
+    | just cx, nothing, hpx, hpy =>
+      \case U.cmra_pcore_ne n x y cx h hpx \with {
+        | (_, hpy', _) =>
+          \case transport (\lam z => z = nothing) hpy' hpy
+                : (just _ : Maybe U.E) = nothing \with {}
+      }
+    | nothing, just cy, hpx, hpy =>
+      \case U.cmra_pcore_ne n y x cy (U.ofe_dist_sym n x y h) hpy \with {
+        | (_, hpx', _) =>
+          \case transport (\lam z => z = nothing) hpx' hpx
+                : (just _ : Maybe U.E) = nothing \with {}
+      }
+  }
+
+-- | The total core is a left identity: `core x · x = x`. Uses `cmra_pcore_l`
+-- | when a partial core exists, and the unit left-identity law otherwise.
+\lemma ucmra_core_left_id {U : UCMRA} (x : U.E)
+  : U.op (ucmra_core x) x = x
+  => \case pcore {U} x \as px, idp : pcore {U} x = px
+  \return U.op (\case px \with { | just c => c | nothing => U.unit }) x = x
+  \with {
+    | just c, hpx => U.cmra_pcore_l x c hpx
+    | nothing, _  => U.ucmra_unit_left_id x
+  }
+
+-- | The total core is idempotent: `core (core x) = core x`. When `x` has a core
+-- | `c`, idempotence of `pcore` (`pcore c = just c`) collapses the nested case;
+-- | when it does not, both sides reduce to `ε` via `ucmra_pcore_unit`.
+\lemma ucmra_core_idemp {U : UCMRA} (x : U.E)
+  : ucmra_core (ucmra_core x) = ucmra_core x
+  => \case pcore {U} x \as px, idp : pcore {U} x = px
+  \return ucmra_core {U} (\case px \with { | just c => c | nothing => U.unit })
+    = (\case px \with { | just c => c | nothing => U.unit })
+  \with {
+    | just c, hpx =>
+      \let
+        | hpcc : pcore {U} c = just c => U.cmra_pcore_idemp x c hpx
+      \in path (\lam i =>
+          \case hpcc @ i \with {
+            | just c' => c'
+            | nothing => U.unit
+          })
+    | nothing, _ =>
+      path (\lam i =>
+          \case U.ucmra_pcore_unit @ i \with {
+            | just u => u
+            | nothing => U.unit
+          })
+  }
+
+-- | The total core is monotone w.r.t. inclusion: `x ≼ y` implies `core x ≼ core y`.
+-- | If `x` has no partial core, `core x = ε` is below everything (`ucmra_unit_least`);
+-- | otherwise `cmra_pcore_mono` gives the included core of `y`, transported through
+-- | the definition of `ucmra_core`.
+\lemma ucmra_core_mono {U : UCMRA} (x y : U.E)
+                       (h : incl {U.E} {U} {\new Op U.E { | op => U.op }} x y)
+  : incl {U.E} {U} {\new Op U.E { | op => U.op }} (ucmra_core x) (ucmra_core y)
+  => \case pcore {U} x \as px, idp : pcore {U} x = px
+  \return incl {U.E} {U} {\new Op U.E { | op => U.op }}
+      (\case px \with { | just c => c | nothing => U.unit })
+      (ucmra_core y)
+  \with {
+    | nothing, _ => ucmra_unit_least (ucmra_core y)
+    | just cx, hpx =>
+      \case U.cmra_pcore_mono x y cx h hpx \with {
+        | (cy, hpy, hincl_cy) =>
+          transport
+              (\lam py => incl {U.E} {U} {\new Op U.E { | op => U.op }}
+                  cx
+                  (\case py \with { | just c => c | nothing => U.unit }))
+              (inv hpy)
+              hincl_cy
+      }
+  }

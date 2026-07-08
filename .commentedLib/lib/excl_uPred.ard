@@ -1,0 +1,139 @@
+Now I have enough understanding to write accurate documentation. The entire file is a commented-out draft module; I'll preserve every line exactly and insert `-- |` doc-comments.
+
+-- | **Module `lib.excl_uPred`** — the BI (bunched-implication / separation-logic)
+-- | interpretation built on top of the *exclusive* unital CMRA `ExclUCMRA A`.
+-- |
+-- | In the Iris literature, every CMRA (camera) `M` induces a model of the separation
+-- | logic `uPred M`: step-indexed, resource-indexed predicates over `M`. This module
+-- | instantiates that construction with the exclusive camera `Excl A`, which holds at
+-- | most one valid element (ownership of a resource exactly once). It provides:
+-- |   * `BIExcl A` — the `BIBase` (the carrier of propositions plus all BI connectives
+-- |     `emp, pure, ∧, ∨, →, ∀, ∃, ∗, -∗, persistently, later`) for `ExclUCMRA A`.
+-- |   * `BIMixinExcl A` — the proof that these connectives satisfy the `BIMixin` axioms
+-- |     (the algebraic laws of a bunched-implication logic: introduction/elimination
+-- |     rules for each connective, commutativity/associativity/unit laws of `∗`, etc.).
+-- |
+-- | NOTE: this module is currently disabled (entirely commented out) and is a
+-- | work in progress — several proof obligations (`impl_intro_r`, `emp_sep_2`,
+-- | `wand_intro`, `wand_elim`) are still left as holes `{?}`.
+-- \import Logic
+-- \import Paths
+-- \import Data.Maybe
+-- \import Arith.Nat
+-- \import Order.PartialOrder
+-- \import ofe
+-- \import cmra
+-- \import lib.excl_cmra
+-- \import uPred
+-- \import interface
+--
+-- -- =================================================================================
+-- -- uPred interpretation for ExclUCMRA
+-- -- =================================================================================
+--
+-- | `BIExcl A` is the `BIBase` of separation-logic propositions over the exclusive
+-- | unital CMRA `ExclUCMRA A`, obtained by applying the generic `uPred` model functor
+-- | `BIuPred` to that camera. It fixes the carrier of propositions and all BI
+-- | connectives; the algebraic laws are supplied separately by `BIMixinExcl`.
+-- \func BIExcl (A : OFE) : BIBase => BIuPred (ExclUCMRA A)
+--
+-- -- =================================================================================
+-- -- BIMixin proofs for ExclUCMRA
+-- -- =================================================================================
+--
+-- | `BIMixinExcl A` proves that the connectives of `BIExcl A` satisfy the `BIMixin`
+-- | axioms, i.e. that the `uPred` model over the exclusive camera really is a model of
+-- | bunched-implication separation logic. Each field below discharges one BI law,
+-- | working pointwise at step-index `n` and resource `a`.
+-- \func BIMixinExcl (A : OFE) : BIMixin \cowith
+--   | BIBase => BIExcl A
+--
+--   -- | Pure intro: from a proof of `phi` any `P` entails `pure phi` (ignore the
+--   -- | resource and step-index, just return the proof of `phi`).
+--   | bi_mixin_pure_intro => \lam phi P h n a hP => h
+--   -- | Pure elim: if `phi` implies `True |- P`, then `pure phi |- P`; feed the
+--   -- | embedded proof `hp : phi` into `h` and apply at `(n, a, ())`.
+--   | bi_mixin_pure_elim => \lam phi P h n a hp => h hp n a ()
+--
+--   -- | And intro: pair the two entailments `P |- Q` and `P |- R` to get `P |- Q ∧ R`.
+--   | bi_mixin_and_intro => \lam P Q R hPQ hPR n a hP => (hPQ n a hP, hPR n a hP)
+--   -- | And elim left: a proof of `P ∧ Q` is a pair; project its first component.
+--   | bi_mixin_and_elim_l => \lam P Q n a hPQ => hPQ.1
+--   -- | And elim right: project the second component of the `P ∧ Q` pair.
+--   | bi_mixin_and_elim_r => \lam P Q n a hPQ => hPQ.2
+--
+--   -- | Or intro left/right: inject a proof of `P` (resp. `Q`) into the disjunction
+--   -- | `P ∨ Q` (modelled as a propositional `||`).
+--   | bi_mixin_or_intro_l => \lam P Q n a hP => byLeft hP
+--   | bi_mixin_or_intro_r => \lam P Q n a hQ => byRight hQ
+--   -- | Or elim: case-split on the disjunction and apply the matching hypothesis
+--   -- | (`P |- R` or `Q |- R`).
+--   | bi_mixin_or_elim => \lam P Q R hPR hQR n a hPQ => \case hPQ \with {
+--     | byLeft hP => hPR n a hP
+--     | byRight hQ => hQR n a hQ
+--   }
+--
+--   -- | Impl intro (right): currying `P ∧ Q |- R` into `P |- Q ->> R`; still a hole.
+--   | bi_mixin_impl_intro_r => \lam P Q R hPQR n a hP m m_le_n hQma => {?}
+--   -- | Impl elim (left): given `P |- Q ->> R` and a witness of `P ∧ Q`, instantiate
+--   -- | the implication at the same step `n`/resource `a` (with `<=-refl`) to get `R`.
+--   | bi_mixin_impl_elim_l => \lam P Q R hPQR n a (hP, hQ) => hPQR n a hP n <=-refl a hQ
+--
+--   -- | Forall intro: from `∀ t. P |- Phi t` build `P |- ∀ t. Phi t` by abstracting `t`.
+--   | bi_mixin_forall_intro => \lam P Phi h n a hP t => h t n a hP
+--   -- | Forall elim: instantiate a proof of `∀ t. Phi t` at the chosen witness `t`.
+--   | bi_mixin_forall_elim => \lam Phi t n a hForall => hForall t
+--
+--   -- | Exist intro: package a witness `t` and a proof of `Phi t` into `∃ t. Phi t`
+--   -- | (using the propositional truncation `inP`).
+--   | bi_mixin_exist_intro => \lam Phi t n a hPhi => inP (t, hPhi)
+--   -- | Exist elim: unpack the truncated existential and apply the uniform `Phi t |- Q`.
+--   | bi_mixin_exist_elim => \lam Phi Q h n a hExist => \case hExist \with {
+--     | inP (t, hPhi) => h t n a hPhi
+--   }
+--
+--   -- | Separating-conjunction monotonicity: a proof of `P ∗ Q` is a resource split
+--   -- | `a ≡ a1 · a2` with `P` at `a1` and `Q` at `a2`; rewrite each side via the
+--   -- | entailments `P |- P'`, `Q |- Q'` keeping the same split.
+--   | bi_mixin_sep_mono => \lam P P' Q Q' hPP' hQQ' n a hSep => \case hSep \with {
+--     | inP (a1, a2, dist_a, hP, hQ) => inP (a1, a2, dist_a, hPP' n a1 hP, hQQ' n a2 hQ)
+--   }
+--   -- | Left unit of `∗` (one direction): `P |- emp ∗ P`. Witness the split with the
+--   -- | camera unit on the left, using the unit left-identity law to make the split
+--   -- | distance-equal to `a`, and `emp` holds at the unit.
+--   | bi_mixin_emp_sep_1 => \lam P n a hP => inP ((ExclUCMRA A).unit, a,
+--                                                 transport (\lam w => (ExclUCMRA A).dist n a w) (inv ((ExclUCMRA A).ucmra_unit_left_id a)) ((ExclUCMRA A).ofe_dist_refl n a),
+--                                                 inP ((ExclUCMRA A).unit, transport (\lam w => (ExclUCMRA A).dist n (ExclUCMRA A).unit w) (inv ((ExclUCMRA A).ucmra_unit_left_id (ExclUCMRA A).unit)) ((ExclUCMRA A).ofe_dist_refl n (ExclUCMRA A).unit)),
+--                                                 hP)
+--   -- | Left unit of `∗` (other direction): `emp ∗ P |- P`; still a hole.
+--   | bi_mixin_emp_sep_2 => {?}
+--   -- | Commutativity of `∗`: swap the two halves of the split and transport the
+--   -- | distance witness along camera commutativity `a1 · a2 ≡ a2 · a1`.
+--   | bi_mixin_sep_comm => \lam P Q n a hSep => \case hSep \with {
+--     | inP (a1, a2, dist_a, hP, hQ) => inP (a2, a1,
+--                                            transport (\lam w => (ExclUCMRA A).dist n a w) ((ExclUCMRA A).cmra_comm a1 a2) dist_a,
+--                                            hQ, hP)
+--   }
+--   -- | Associativity of `∗`: from `(P ∗ Q) ∗ R` with splits `a ≡ a12 · a3` and
+--   -- | `a12 ≡ a1 · a2`, re-bracket to `P ∗ (Q ∗ R)` with split `a ≡ a1 · (a2 · a3)`.
+--   -- | The new distance witness is obtained by transitivity of `dist`, transporting
+--   -- | along `cmra_assoc` and using right-congruence `cmra_op_ne_2` of the operation.
+--   | bi_mixin_sep_assoc => \lam P Q R n a hSep => \case hSep \with {
+--     | inP (a12, a3, dist_a, hPQ, hR) => \case hPQ \with {
+--       | inP (a1, a2, dist_a12, hP, hQ) => inP (a1, (ExclUCMRA A).op a2 a3,
+--                                                (ExclUCMRA A).ofe_dist_trans n a ((ExclUCMRA A).op a12 a3) ((ExclUCMRA A).op a1 ((ExclUCMRA A).op a2 a3))
+--                                                dist_a
+--                                                (transport (\lam w => (ExclUCMRA A).dist n ((ExclUCMRA A).op a12 a3) w)
+--                                                (inv ((ExclUCMRA A).cmra_assoc a1 a2 a3))
+--                                                ((ExclUCMRA A).cmra_op_ne_2 a3 n a12 ((ExclUCMRA A).op a1 a2) dist_a12)),
+--                                                hP,
+--                                                inP (a2, a3, (ExclUCMRA A).ofe_dist_refl n ((ExclUCMRA A).op a2 a3), hQ, hR))
+--     }
+--   }
+--
+--   -- | Wand intro: from `P ∗ Q |- R` derive `P |- Q -∗ R` (the right adjoint of `∗`);
+--   -- | still a hole.
+--   | bi_mixin_wand_intro => {?}
+--   -- | Wand elim (modus ponens for `-∗`): `P ∗ (P -∗ Q) |- Q`; still a hole.
+--   | bi_mixin_wand_elim => {?}
+--

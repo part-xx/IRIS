@@ -1,0 +1,3 @@
+The file `src/cofe_solver.ard` is empty — it contains 0 lines and no code. The source block in your prompt was also empty, which matches.
+
+There are no definitions, no imports, and no module body to document, so there's nothing to add comments to (and the rules forbid me from adding code). If you intended a different file, or if `cofe_solver.ard` is meant to contain a COFE solver formalization that hasn't been written yet, let me know — I can either point you to the right file or, if you want, draft the module and document it (that would mean writing code, which is outside the current "comments only" scope).

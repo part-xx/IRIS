@@ -1,0 +1,297 @@
+-- | This module defines the **interface of a BI (Bunched Implications) algebra**,
+-- | the algebraic structure underlying Iris's separation logic. In the Iris
+-- | literature this corresponds to the `bi` type class: a logic equipped with the
+-- | usual intuitionistic connectives (`emp`, `pure`, `∧`, `∨`, `→`, `∀`, `∃`)
+-- | together with the substructural separation connectives (separating
+-- | conjunction `∗`, magic wand `−∗`), the `persistently` modality `□`, and the
+-- | `later` modality `▷`. The structure is split, as in Iris, into a `BIBase`
+-- | (the carrier `E` of propositions, ordered by entailment `|-`, and the
+-- | operation symbols) and a family of *mixins* that bundle the proof rules:
+-- | `BIMixin` (intuitionistic + separation laws), `BIPersistentlyMixin` (laws of
+-- | `□`), and `BILaterMixin` (laws of `▷`). The full algebra `BI` is the
+-- | combination of all three. The trailing `\lemma`s simply re-expose each mixin
+-- | axiom as a stand-alone, instance-resolved lemma for convenient use in proofs.
+\import Logic
+\import Order.PartialOrder
+\import Paths
+\import derived_laws
+
+-- | Carrier and signature of a BI algebra. `E` (inherited from `Preorder`) is the
+-- | type of propositions ordered by entailment, and each field is one of the BI
+-- | connectives: the empty resource `emp`, embedding of meta-level props `pure`,
+-- | the lattice connectives, quantifiers over an arbitrary set, separating
+-- | conjunction `bi_sep`, magic wand `bi_wand`, and the `persistently`/`later`
+-- | modalities. Only the symbols live here; their laws are added by the mixins.
+-- Represents the basic operation for the separation logic
+\class BIBase \extends Preorder {
+  | bi_emp : E
+  | bi_pure : \Prop -> E
+  | bi_and : E -> E -> E
+  | bi_or : E -> E -> E
+  | bi_impl : E -> E -> E
+  | bi_forall (A : \Set) : (A -> E) -> E
+  | bi_exist (A : \Set) : (A -> E) -> E
+  | bi_sep : E -> E -> E
+  | bi_wand : E -> E -> E
+  | bi_persistently : E -> E
+  | bi_later : E -> E
+
+
+  --   \func \infixl 6 ∧ (P Q : E) => bi_and P Q
+  --   \func \infixl 5 ∨ (P Q : E) => bi_or P Q
+  --   \func \infixr 3 ->> (P Q : E) => bi_impl P Q
+  --   \func \infixl 6 ∗ (P Q : E) => bi_sep P Q
+  --   \func \infixr 3 -∗ (P Q : E) => bi_wand P Q
+
+}
+
+-- | The empty proposition `emp`, the unit of separating conjunction.
+\func emp {B : BIBase} => B.bi_emp
+-- | Embedding `⌜φ⌝` of a meta-level proposition `φ : \Prop` into the BI logic.
+\func pure {B : BIBase} (phi : \Prop) => B.bi_pure phi
+-- | Notation for ordinary conjunction `P ∧ Q`.
+\func \infixl 5 && {B : BIBase} (P Q : B.E) => B.bi_and P Q
+-- | Notation for disjunction `P ∨ Q`.
+\func \infixl 4 || {B : BIBase} (P Q : B.E) => B.bi_or P Q
+-- | Entailment `P ⊢ Q`, i.e. the underlying preorder `<=` on propositions.
+\func \infix 2 |- {B : BIBase} (P Q : B.E) => B.<= P Q
+-- | Notation for (ordinary) implication `P → Q`.
+\func \infixr 3 ->> {B : BIBase} (P Q : B.E) => B.bi_impl P Q
+-- | Universal quantification `∀ a : A, Phi a` over a set `A`.
+\func forall {B : BIBase} (A : \Set) (Phi : A -> B.E) => B.bi_forall A Phi
+-- | Existential quantification `∃ a : A, Phi a` over a set `A`.
+\func exists {B : BIBase} (A : \Set) (Phi : A -> B.E) => B.bi_exist A Phi
+-- | Separating conjunction `P ∗ Q`: the resources of `P` and `Q` held disjointly.
+\func \infixl 6 * {B : BIBase} (P Q : B.E) => B.bi_sep P Q
+-- | Magic wand `P −∗ Q`: consuming the resources of `P` yields `Q`.
+\func \infixr 3 -* {B : BIBase} (P Q : B.E) => B.bi_wand P Q
+-- | The persistently modality `□ P`: `P` holds without owning any exclusive resource.
+\func persis {B : BIBase} (P : B.E) => B.bi_persistently P
+-- | The later modality `▷ P`: `P` holds after one step of (guarded) recursion.
+\func later {B : BIBase} (P : B.E) => B.bi_later P
+
+-- accept for B.E
+
+-- | The true proposition, `pure` of the singleton `\Sigma` (top of the logic).
+\func True {B : BIBase} => B.bi_pure (\Sigma)
+-- | The false proposition, `pure` of `Empty` (bottom of the logic).
+\func False {B : BIBase} => B.bi_pure Empty
+
+
+-- | Proof rules for the intuitionistic and separation fragments of a BI algebra.
+-- | These are the standard Iris introduction/elimination laws: `pure` reflection,
+-- | `∧`/`∨`/`→` lattice rules, `∀`/`∃` quantifier rules, and the monoidal-closed
+-- | structure of `∗`/`−∗` (monotonicity, `emp` as unit, commutativity,
+-- | associativity, and the wand adjunction).
+-- Axioms for the BI operations
+\class BIMixin \extends BIBase {
+
+  -- | If meta-level `φ` holds, then every `P` entails `⌜φ⌝`.
+  | bi_mixin_pure_intro (phi : \Prop) (P : E) : phi ->  P |- pure phi
+  -- | To prove `⌜φ⌝ ⊢ P` it suffices to assume `φ` at the meta level and prove `True ⊢ P`.
+  | bi_mixin_pure_elim (phi : \Prop) (P : E) : (phi ->  True |- P) -> pure phi |- P
+
+  -- | Introduction of `∧`: from `P ⊢ Q` and `P ⊢ R` conclude `P ⊢ Q ∧ R`.
+  | bi_mixin_and_intro (P Q R : E)  : P |- Q -> P |- R -> P |- (Q && R)
+  -- | Left projection of conjunction: `P ∧ Q ⊢ P`.
+  | bi_mixin_and_elim_l (P Q : E) : (P && Q) |- P
+  -- | Right projection of conjunction: `P ∧ Q ⊢ Q`.
+  | bi_mixin_and_elim_r (P Q : E) : (P && Q) |- Q
+
+  -- | Left injection into disjunction: `P ⊢ P ∨ Q`.
+  | bi_mixin_or_intro_l (P Q : E) : P |- P || Q
+  -- | Right injection into disjunction: `Q ⊢ P ∨ Q`.
+  | bi_mixin_or_intro_r (P Q : E) : Q |- P || Q
+  -- | Case analysis on disjunction: from `P ⊢ R` and `Q ⊢ R` conclude `P ∨ Q ⊢ R`.
+  | bi_mixin_or_elim (P Q R : E) : P |- R -> Q |- R -> (P || Q) |- R
+
+  -- | Implication introduction (currying half of the adjunction): `P ∧ Q ⊢ R` gives `P ⊢ Q → R`.
+  | bi_mixin_impl_intro_r (P Q R : E) : P && Q |- R -> P |- Q ->> R
+  -- | Implication elimination (uncurrying): `P ⊢ Q → R` gives `P ∧ Q ⊢ R`.
+  | bi_mixin_impl_elim_l (P Q R : E) : P |- Q ->> R -> (P && Q)  |- R
+
+  -- | `∀` introduction: if `P ⊢ Phi a` for every `a`, then `P ⊢ ∀ a, Phi a`.
+  | bi_mixin_forall_intro {A : \Set} (P : E) (Phi : A -> E) : (\Pi (a : A) -> P |- (Phi a)) -> P |- (forall A Phi)
+  -- | `∀` elimination (instantiation): `(∀ a, Phi a) ⊢ Phi a`.
+  | bi_mixin_forall_elim {A : \Set} (Phi : A -> E) (a : A) : (forall A Phi) |- (Phi a)
+
+  -- | `∃` introduction (witnessing): `Phi a ⊢ ∃ a, Phi a`.
+  | bi_mixin_exist_intro {A : \Set} (Phi : A -> E) (a : A) : (Phi a) |- (exists A Phi)
+  -- | `∃` elimination: if `Phi a ⊢ Q` uniformly in `a`, then `(∃ a, Phi a) ⊢ Q`.
+  | bi_mixin_exist_elim {A : \Set} (Phi : A -> E) (Q : E) : (\Pi (a : A) -> (Phi a) |- Q) ->  (exists A Phi) |- Q
+
+  -- | Monotonicity of `∗` in both arguments.
+  | bi_mixin_sep_mono (P P' Q Q' : E) : P |- P' -> Q |- Q' -> (P * Q) |- (P' * Q')
+  -- | `emp` is a left unit of `∗` (introduction direction): `P ⊢ emp ∗ P`.
+  | bi_mixin_emp_sep_1 (P : E) : P |- (emp * P)
+  -- | `emp` is a left unit of `∗` (elimination direction): `emp ∗ P ⊢ P`.
+  | bi_mixin_emp_sep_2 (P : E) : (emp * P) |- P
+  -- | Commutativity of separating conjunction: `P ∗ Q ⊢ Q ∗ P`.
+  | bi_mixin_sep_comm (P Q : E) : (P * Q) |- (Q * P)
+  -- | Associativity of separating conjunction: `(P ∗ Q) ∗ R ⊢ P ∗ (Q ∗ R)`.
+  | bi_mixin_sep_assoc (P Q R : E) : ((P * Q) * R) |- (P * (Q * R))
+
+  -- | Wand introduction (adjunction): `P ∗ Q ⊢ R` gives `P ⊢ Q −∗ R`.
+  | bi_mixin_wand_intro (P Q R : E) : (P * Q) |- R -> P |- (Q -* R)
+  -- | Wand elimination (modus ponens for `−∗`): `P ∗ (P −∗ Q) ⊢ Q`.
+  | bi_mixin_wand_elim (P Q : E) : (P * (P -* Q)) |- Q
+}
+
+
+-- | Proof rules for the persistently modality `□`. These mirror Iris's
+-- | `bi_persistently_mixin`: `□` is monotone, idempotent, preserves `emp`, `∧`,
+-- | and `∃`, is absorbing w.r.t. `∗`, and connects `∧` with `∗` on persistent
+-- | propositions. Intuitively `□ P` asserts `P` while owning no exclusive
+-- | resources, so it is freely duplicable.
+\class BIPersistentlyMixin \extends BIBase {
+  -- | Monotonicity: `P ⊢ Q` implies `□ P ⊢ □ Q`.
+  | persistently_mono (P Q : E) : P |- Q -> (bi_persistently P) |- (bi_persistently Q)
+  -- | Idempotence (one direction): `□ P ⊢ □ □ P`.
+  | persistently_idemp_2 (P : E) : (bi_persistently P) |- (bi_persistently (bi_persistently P))
+  -- | `□` preserves `emp`: `emp ⊢ □ emp`.
+  | persistently_emp_2 : emp |- (bi_persistently emp)
+  -- | `□` distributes over conjunction: `□ P ∧ □ Q ⊢ □ (P ∧ Q)`.
+  | persistently_and_2 (P Q : E) : (bi_and (bi_persistently P) (bi_persistently Q)) |- (bi_persistently (bi_and P Q))
+  -- | `□` commutes with existentials: `□ (∃ a, Phi a) ⊢ ∃ a, □ (Phi a)`.
+  | persistently_exist_1 {A : \Type} (Phi : A -> E) : (bi_persistently (bi_exist A Phi)) |- (bi_exist A (\lam a => bi_persistently (Phi a)))
+  -- | Absorption: a persistent fact can drop a separated resource, `□ P ∗ Q ⊢ □ P`.
+  | persistently_absorbing (P Q : E) : (bi_sep (bi_persistently P) Q) |- (bi_persistently P)
+  -- | Persistent conjuncts split off: `□ P ∧ Q ⊢ P ∗ Q` (duplicability of `□`).
+  | persistently_and_sep_elim (P Q : E) : (bi_and (bi_persistently P) Q) |- (bi_sep P Q)
+}
+
+
+-- | Proof rules for the later modality `▷`, used to guard recursive
+-- | definitions and step-indexed reasoning. Follows Iris's `bi_later_mixin`:
+-- | `▷` is monotone, weakening (`P ⊢ ▷ P`), commutes appropriately with `∀`,
+-- | `∃`, `∗`, and `□`, and satisfies the Löb-style excluded-middle law
+-- | `later_false_em` from which Löb induction is derived.
+\class BILaterMixin \extends BIBase {
+  -- | Monotonicity of `▷`: `P ⊢ Q` implies `▷ P ⊢ ▷ Q`.
+  | later_mono (P Q : E) : P |- Q -> bi_later P |- bi_later Q
+  -- | Weakening into the future: `P ⊢ ▷ P`.
+  | later_intro (P : E) : P |- bi_later P
+  -- | `▷` commutes with universal quantification: `(∀ a, ▷ Phi a) ⊢ ▷ ∀ a, Phi a`.
+  | later_forall_2 {A : \Type} (Phi : A -> E) : (bi_forall A (\lam a => bi_later (Phi a))) |- (bi_later (bi_forall A Phi))
+  -- | `▷` of an existential either collapses to `▷ False` or commutes inside.
+  | later_exist_false {A : \Type} (Phi : A -> E) : (bi_later (bi_exist A Phi)) |- (bi_or (bi_later False) (bi_exist A (\lam a => bi_later (Phi a))))
+  -- | `▷` distributes over `∗` (one direction): `▷ (P ∗ Q) ⊢ ▷ P ∗ ▷ Q`.
+  | later_sep_1 (P Q : E) : (bi_later (bi_sep P Q)) |- (bi_sep (bi_later P) (bi_later Q))
+  -- | `▷` distributes over `∗` (other direction): `▷ P ∗ ▷ Q ⊢ ▷ (P ∗ Q)`.
+  | later_sep_2 (P Q : E) : (bi_sep (bi_later P) (bi_later Q)) |- (bi_later (bi_sep P Q))
+  -- | `▷` and `□` commute (one direction): `▷ □ P ⊢ □ ▷ P`.
+  | later_persistently_1 (P : E) : (bi_later (bi_persistently P)) |- (bi_persistently (bi_later P))
+  -- | `▷` and `□` commute (other direction): `□ ▷ P ⊢ ▷ □ P`.
+  | later_persistently_2 (P : E) : bi_persistently (bi_later P) |- bi_later (bi_persistently P)
+  -- | Löb excluded middle: `▷ P ⊢ ▷ False ∨ (▷ False → P)`; the key axiom for Löb induction.
+  | later_false_em (P : E) : bi_later P |- bi_or (bi_later False) (bi_impl (bi_later False) P)
+}
+
+-- | A full BI algebra: combines all the operation laws (`BIMixin`,
+-- | `BIPersistentlyMixin`, `BILaterMixin`) over a shared `BIBase`. This is the
+-- | structure on which Iris's derived laws, invariants, and weakest
+-- | preconditions are built.
+\class BI \extends BIMixin, BIPersistentlyMixin, BILaterMixin
+
+
+
+
+-- =================================================================================
+-- Support lemmas for the BIMixin
+-- =================================================================================
+
+-- | Lemma form of `bi_mixin_pure_intro`: meta-level `φ` lets any `P` entail `⌜φ⌝`.
+\lemma pure_intro_lemma {B : BIMixin} (phi : \Prop) (P : B.E) : phi -> P |- pure phi
+  => B.bi_mixin_pure_intro phi P
+
+-- | Lemma form of `bi_mixin_pure_elim`: discharge `⌜φ⌝` by assuming `φ` at the meta level.
+\lemma pure_elim_lemma {B : BIMixin} (phi : \Prop) (P : B.E) : (phi -> True |- P) -> pure phi |- P
+  => B.bi_mixin_pure_elim phi P
+
+
+-- | Lemma form of left `∧`-elimination: `P ∧ Q ⊢ P`.
+\lemma and_elim_l_lemma {B : BIMixin} (P Q : B.E) : P && Q |- P
+  => B.bi_mixin_and_elim_l P Q
+
+-- | Lemma form of right `∧`-elimination: `P ∧ Q ⊢ Q`.
+\lemma and_elim_r_lemma {B : BIMixin} (P Q : B.E) : P && Q |- Q
+  => B.bi_mixin_and_elim_r P Q
+
+-- | Lemma form of `∧`-introduction: prove both conjuncts from a common premise.
+\lemma and_intro_lemma {B : BIMixin} (P Q R : B.E) : P |- Q -> P |- R -> P |- (Q && R)
+  => B.bi_mixin_and_intro P Q R
+
+-- | Lemma form of left `∨`-introduction: `P ⊢ P ∨ Q`.
+\lemma or_intro_l_lemma {B : BIMixin} (P Q : B.E) : P |- (P || Q)
+  => B.bi_mixin_or_intro_l P Q
+
+-- | Lemma form of right `∨`-introduction: `Q ⊢ P ∨ Q`.
+\lemma or_intro_r_lemma {B : BIMixin} (P Q : B.E) : Q |- (P || Q)
+  => B.bi_mixin_or_intro_r P Q
+
+-- | Lemma form of `∨`-elimination (case split): both disjuncts entail `R`.
+\lemma or_elim_lemma {B : BIMixin} (P Q R : B.E) : P |- R -> Q |- R -> (P || Q) |- R
+  => B.bi_mixin_or_elim P Q R
+
+
+-- | Lemma form of implication introduction: `P ∧ Q ⊢ R` gives `P ⊢ Q → R`.
+\lemma impl_intro_r_lemma {B : BIMixin} (P Q R : B.E) : (P && Q) |- R -> P |- (Q ->> R)
+  => B.bi_mixin_impl_intro_r P Q R
+
+-- | Lemma form of implication elimination: `P ⊢ Q → R` gives `P ∧ Q ⊢ R`.
+\lemma impl_elim_l_lemma {B : BIMixin} (P Q R : B.E) (h : P |- (Q ->> R)) : (P && Q) |- R
+  => B.bi_mixin_impl_elim_l P Q R h
+
+
+-- | Lemma form of `∀`-introduction: prove `P ⊢ Phi a` for every `a`.
+\lemma forall_intro_lemma {B : BIMixin} {A : \Set} (P : B.E) (Phi : A -> B.E) : (\Pi (a : A) -> P |- (Phi a)) -> P |- (forall A Phi)
+  => B.bi_mixin_forall_intro P Phi
+
+-- | Lemma form of `∀`-elimination: instantiate the quantifier at `a`.
+\lemma forall_elim_lemma {B : BIMixin} {A : \Set} (Phi : A -> B.E) (a : A) : (forall A Phi) |- (Phi a)
+  => B.bi_mixin_forall_elim Phi a
+
+-- | Lemma form of `∃`-introduction: provide a witness `a` for the existential.
+\lemma exist_intro_lemma {B : BIMixin} {A : \Set} (Phi : A -> B.E) (a : A) : (Phi a) |- (exists A Phi)
+  => B.bi_mixin_exist_intro Phi a
+
+-- | Lemma form of `∃`-elimination: discharge the witness uniformly in `a`.
+\lemma exist_elim_lemma {B : BIMixin} {A : \Set} (Phi : A -> B.E) (Q : B.E) : (\Pi (a : A) -> (Phi a) |- Q) -> (exists A Phi) |- Q
+  => B.bi_mixin_exist_elim Phi Q
+
+
+-- | Lemma form of `∗`-monotonicity: entailments combine across separating conjunction.
+\lemma sep_mono_lemma {B : BIMixin} (P P' Q Q' : B.E) : P |- P' -> Q |- Q' -> (P * Q) |- (P' * Q')
+  => B.bi_mixin_sep_mono P P' Q Q'
+
+-- | Lemma form of `emp ∗ P` unit (introduction): `P ⊢ emp ∗ P`.
+\lemma emp_sep_1_lemma {B : BIMixin} (P : B.E) : P |- (emp * P)
+  => B.bi_mixin_emp_sep_1 P
+
+-- | Lemma form of `emp ∗ P` unit (elimination): `emp ∗ P ⊢ P`.
+\lemma emp_sep_2_lemma {B : BIMixin} (P : B.E) : (emp * P) |- P
+  => B.bi_mixin_emp_sep_2 P
+
+-- | Lemma form of `∗`-commutativity: `P ∗ Q ⊢ Q ∗ P`.
+\lemma sep_comm_lemma {B : BIMixin} (P Q : B.E) : (P * Q) |- (Q * P)
+  => B.bi_mixin_sep_comm P Q
+
+-- | Lemma form of `∗`-associativity: `(P ∗ Q) ∗ R ⊢ P ∗ (Q ∗ R)`.
+\lemma sep_assoc_lemma {B : BIMixin} (P Q R : B.E) : ((P * Q) * R) |- (P * (Q * R))
+  => B.bi_mixin_sep_assoc P Q R
+
+-- | Lemma form of wand introduction (adjunction): `P ∗ Q ⊢ R` gives `P ⊢ Q −∗ R`.
+\lemma wand_intro_lemma {B : BIMixin} (P Q R : B.E) : (P * Q) |- R -> P |- (Q -* R)
+  => B.bi_mixin_wand_intro P Q R
+
+-- | Lemma form of wand elimination (modus ponens): `P ∗ (P −∗ Q) ⊢ Q`.
+\lemma wand_elim_lemma {B : BIMixin} (P Q : B.E) : (P * (P -* Q)) |- Q
+  => B.bi_mixin_wand_elim P Q
+
+-- =================================================================================
+-- Support lemmas for the BIPersistentlyMixin
+-- =================================================================================
+
+-- =================================================================================
+-- Support lemmas for the BILaterMixin
+-- =================================================================================
